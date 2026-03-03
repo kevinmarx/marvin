@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+deploy/plugins/linear-mcp/
+deploy/plugins/local-memory-mcp/
+
+# User-specific config files (use *.example.json as templates)
+config/default.json
+config/deep-thought.json
+config/remote.json

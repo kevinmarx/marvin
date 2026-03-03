@@ -1,0 +1,43 @@
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: marvin-gateway
+  namespace: marvin
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      hosts:
+        - "CUSTOM_DOMAIN"
+      tls:
+        mode: SIMPLE
+        credentialName: marvin-tls
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "CUSTOM_DOMAIN"
+      tls:
+        httpsRedirect: true
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: marvin
+  namespace: marvin
+spec:
+  hosts:
+    - "CUSTOM_DOMAIN"
+  gateways:
+    - marvin-gateway
+  http:
+    - route:
+        - destination:
+            host: marvin.marvin.svc.cluster.local
+            port:
+              number: 80

@@ -1,0 +1,38 @@
+{
+  "team": "YourTeam",
+  "assignee": "your-linear-username",
+  "repos": {
+    "your-infra-repo": "/path/to/your-infra-repo",
+    "your-main-repo": "/path/to/your-main-repo"
+  },
+  "state_db": "~/.deep-thought/state/deep-thought.db",
+  "log_dir": "~/.deep-thought/logs",
+  "backup_dir": "~/.deep-thought/backups",
+  "linear_label": "🧠 Deep Thought",
+  "github_org": "your-github-org",
+  "github_user": "your-github-username",
+  "linear_workspace_slug": "your-workspace",
+  "plugins_dir": "/path/to/mcp-plugins",
+  "cycle_interval_seconds": 21600,
+  "self_restart_after_cycles": 4,
+
+  "limits": {
+    "max_tickets_per_cycle": 5,
+    "confidence_threshold": 0.7,
+    "finding_cooldown_days": 7,
+    "stale_scanner_minutes": 60,
+    "alert_lookback_hours": 12,
+    "trace_lookback_hours": 12,
+    "log_lookback_hours": 12,
+    "error_rate_spike_threshold": 2.0,
+    "p99_regression_threshold_ms": 500,
+    "dependency_staleness_days": 180
+  },
+
+  "datadog": {
+    "site": "datadoghq.com",
+    "monitor_tags": ["team:your-team"],
+    "service_filter": "your-service-*",
+    "env": "production"
+  }
+}

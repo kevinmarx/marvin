@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: marvin
+  namespace: marvin
+  labels:
+    app: marvin
+spec:
+  replicas: 1
+  # Recreate strategy — only one instance can use the EBS volumes at a time
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: marvin
+  template:
+    metadata:
+      labels:
+        app: marvin
+      annotations:
+        # Exclude orchestrator's long-lived connections from Istio sidecar timeout
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+        sidecar.istio.io/inject: "true"
+    spec:
+      # Run init as root to fix volume ownership, then main container as marvin
+      initContainers:
+        - name: fix-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /data/state /data/repos"]
+          volumeMounts:
+            - name: state
+              mountPath: /data/state
+            - name: repos
+              mountPath: /data/repos
+      containers:
+        # ── Marvin (orchestrator + dashboard) ────────────────────────────
+        - name: marvin
+          image: marvin:latest
+          env:
+            - name: MARVIN_REMOTE
+              value: "1"
+            - name: MARVIN_CONFIG
+              value: /home/marvin/marvin/config/remote.json
+            - name: MARVIN_PLUGINS_DIR
+              value: /home/marvin/plugins
+            - name: HOME
+              value: /home/marvin
+          envFrom:
+            - secretRef:
+                name: marvin-secrets
+          ports:
+            - name: dashboard
+              containerPort: 7777
+              protocol: TCP
+          volumeMounts:
+            - name: state
+              mountPath: /data/state
+            - name: repos
+              mountPath: /data/repos
+          livenessProbe:
+            httpGet:
+              path: /api/heartbeat
+              port: 7777
+            initialDelaySeconds: 120
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/heartbeat
+              port: 7777
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+
+        # ── oauth2-proxy sidecar (AAD auth) ──────────────────────────────
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+          args:
+            - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: marvin-secrets
+                  key: OAUTH2_PROXY_CLIENT_ID
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: marvin-secrets
+                  key: OAUTH2_PROXY_CLIENT_SECRET
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: marvin-secrets
+                  key: OAUTH2_PROXY_COOKIE_SECRET
+          ports:
+            - name: proxy
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: oauth2-proxy-config
+              mountPath: /etc/oauth2-proxy
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: marvin-state
+        - name: repos
+          persistentVolumeClaim:
+            claimName: marvin-repos
+        - name: oauth2-proxy-config
+          configMap:
+            name: oauth2-proxy-config

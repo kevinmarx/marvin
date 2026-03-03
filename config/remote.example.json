@@ -1,0 +1,50 @@
+{
+  "team": "YourTeam",
+  "assignee": "me",
+  "linear_user": "your-linear-username",
+  "ticket_states": ["triage", "backlog", "unstarted"],
+  "claim_unassigned": false,
+  "repos": {
+    "your-infra-repo": "/data/repos/your-infra-repo",
+    "your-main-repo": "/data/repos/your-main-repo"
+  },
+  "worktree_root": "/data/repos/worktrees",
+  "complexity_threshold": 2,
+  "confidence_threshold": 0.7,
+  "digest_interval_minutes": 60,
+  "state_db": "/data/state/marvin.db",
+  "log_dir": "/data/state/logs",
+  "backup_dir": "/data/state/backups",
+  "github_org": "your-github-org",
+  "github_user": "your-github-username",
+  "linear_workspace_slug": "your-workspace",
+  "branch_prefix": "users/your-username",
+  "git_name": "Your Name",
+  "git_email": "you@example.com",
+  "plugins_dir": "/app/plugins",
+  "marvin_repo_path": "/app/marvin",
+  "labels": {
+    "platform": "Platform"
+  },
+  "cycle_interval_seconds": 1800,
+  "self_restart_after_cycles": 48,
+
+  "limits": {
+    "defer_max_followups": 3,
+    "defer_min_interval_hours": 24,
+    "defer_nudge_after_days": 7,
+    "ci_fix_max_attempts": 5,
+    "ci_fix_min_interval_minutes": 10,
+    "ci_fix_max_files": 5,
+    "executor_max_test_retries": 2,
+    "poll_interval_idle_seconds": 900,
+    "poll_interval_active_seconds": 120,
+    "stale_executor_minutes": 120,
+    "stale_reviewer_minutes": 60,
+    "stale_ci_fix_minutes": 30,
+    "stale_auditor_minutes": 30,
+    "stale_docs_minutes": 30,
+    "rebase_max_attempts": 3,
+    "rebase_min_interval_minutes": 10
+  }
+}

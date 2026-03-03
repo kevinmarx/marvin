@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: marvin-state
+  namespace: marvin
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # Use your cluster's EBS StorageClass (commonly "gp2", "gp3", or "ebs-sc")
+  # Check available: kubectl get storageclass
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: marvin-repos
+  namespace: marvin
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 50Gi

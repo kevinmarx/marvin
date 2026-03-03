@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: marvin
+
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - istio.yaml
+
+# Secret is NOT included — create it manually:
+# kubectl -n marvin create secret generic marvin-secrets \
+#   --from-literal=ANTHROPIC_API_KEY='...' \
+#   --from-literal=GH_TOKEN='...' \
+#   --from-literal=LINEAR_API_KEY='...' \
+#   --from-literal=OAUTH2_PROXY_CLIENT_ID='...' \
+#   --from-literal=OAUTH2_PROXY_CLIENT_SECRET='...' \
+#   --from-literal=OAUTH2_PROXY_COOKIE_SECRET="$(python3 -c 'import os,base64;print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
