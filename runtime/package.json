@@ -1,0 +1,32 @@
+{
+  "name": "@marvin/runtime",
+  "version": "0.1.0",
+  "description": "Marvin agent runtime — model-agnostic agent execution engine",
+  "type": "module",
+  "main": "dist/agent.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/agent.ts",
+    "orchestrator": "tsx src/orchestrator-cli.ts",
+    "realtime": "tsx src/realtime-cli.ts",
+    "typecheck": "tsc --noEmit",
+    "compile:harness": "tsx ../harness/compile.ts --target all"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "glob": "^11.0.0",
+    "lodash-es": "^4.17.21",
+    "minimatch": "^10.0.0",
+    "openai": "^4.80.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/lodash-es": "^4.17.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -11,6 +11,7 @@ import subprocess
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import unquote, parse_qs
 
 DB_PATH = Path.home() / ".marvin" / "state" / "marvin.db"
 SCRIPT_DIR = Path(__file__).parent
@@ -390,14 +391,15 @@ def get_active_teammates():
     except sqlite3.OperationalError:
         pass
 
-    # Reviewers: review_runs with status='running'
+    # Reviewers: review_runs with status='running' or 'queued'
     try:
         for rr in query(
             "SELECT rr.ticket_linear_id, rr.pr_number, rr.started_at, rr.last_phase, rr.last_phase_at, "
+            "rr.status as run_status, "
             "t.identifier, t.title, t.target_repo "
             "FROM review_runs rr "
             "LEFT JOIN tickets t ON t.linear_id = rr.ticket_linear_id "
-            "WHERE rr.status = 'running'"
+            "WHERE rr.status IN ('running', 'queued')"
         ):
             started = rr.get("started_at", "")
             duration = _minutes_since(started, now)
@@ -435,12 +437,12 @@ def get_active_teammates():
     except sqlite3.OperationalError:
         pass
 
-    # CI fixers: ci_fix_runs with status='running'
+    # CI fixers: ci_fix_runs with status='running' or 'queued'
     try:
         for cf in query(
-            "SELECT cf.id, cf.pr_number, cf.repo, cf.started_at, cf.failure_type, cf.last_phase, cf.last_phase_at, "
+            "SELECT cf.id, cf.pr_number, cf.repo, cf.started_at, cf.status as run_status, cf.failure_type, cf.last_phase, cf.last_phase_at, "
             "(SELECT COUNT(*) FROM ci_fix_runs c2 WHERE c2.pr_number = cf.pr_number AND c2.repo = cf.repo) as attempt_count "
-            "FROM ci_fix_runs cf WHERE cf.status = 'running'"
+            "FROM ci_fix_runs cf WHERE cf.status IN ('running', 'queued')"
         ):
             started = cf.get("started_at", "")
             duration = _minutes_since(started, now)
@@ -465,14 +467,14 @@ def get_active_teammates():
     except sqlite3.OperationalError:
         pass
 
-    # Auditors: audit_runs with status='running'
+    # Auditors: audit_runs with status='running' or 'queued'
     try:
         for ar in query(
-            "SELECT ar.pr_number, ar.repo, ar.started_at, ar.last_phase, ar.last_phase_at, "
+            "SELECT ar.pr_number, ar.repo, ar.started_at, ar.status as run_status, ar.last_phase, ar.last_phase_at, "
             "p.title as pr_title, p.author as pr_author "
             "FROM audit_runs ar "
             "LEFT JOIN pull_requests p ON p.pr_number = ar.pr_number AND p.repo = ar.repo "
-            "WHERE ar.status = 'running'"
+            "WHERE ar.status IN ('running', 'queued')"
         ):
             started = ar.get("started_at", "")
             duration = _minutes_since(started, now)
@@ -499,11 +501,11 @@ def get_active_teammates():
     except sqlite3.OperationalError:
         pass
 
-    # Docs workers: doc_runs with status='running'
+    # Docs workers: doc_runs with status='running' or 'queued'
     try:
         for dr in query(
-            "SELECT id, ticket_identifier, repo, started_at, last_phase, last_phase_at "
-            "FROM doc_runs WHERE status = 'running'"
+            "SELECT id, ticket_identifier, repo, started_at, status as run_status, last_phase, last_phase_at "
+            "FROM doc_runs WHERE status IN ('running', 'queued')"
         ):
             started = dr.get("started_at", "")
             duration = _minutes_since(started, now)
@@ -585,6 +587,219 @@ def get_doc_runs():
         )
     except sqlite3.OperationalError:
         return []
+
+
+def _model_tables_exist():
+    """Check whether the model feedback migration has been applied."""
+    try:
+        query("SELECT 1 FROM model_runs LIMIT 1")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def get_unrated_model_runs():
+    """Get model_runs where human_rating IS NULL."""
+    try:
+        return query(
+            "SELECT id, skill, model, task_type, language, complexity, "
+            "ticket_identifier, success, tests_passed, test_retries, "
+            "ci_passed, tokens_used, duration_seconds, created_at "
+            "FROM model_runs WHERE human_rating IS NULL "
+            "ORDER BY created_at DESC LIMIT 20"
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_recent_model_runs():
+    """Get last 50 model_runs."""
+    try:
+        return query(
+            "SELECT id, skill, model, task_type, language, complexity, "
+            "ticket_identifier, success, tests_passed, test_retries, "
+            "ci_passed, tokens_used, duration_seconds, created_at, human_rating "
+            "FROM model_runs ORDER BY created_at DESC LIMIT 50"
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_routing_weights():
+    """Get all routing_weights rows."""
+    try:
+        return query(
+            "SELECT task_type, language, model, score, sample_count, confidence, updated_at "
+            "FROM routing_weights ORDER BY task_type, score DESC"
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_routing_overrides():
+    """Get all routing_overrides rows."""
+    try:
+        return query(
+            "SELECT task_type, language, model, reason, created_at, expires_at "
+            "FROM routing_overrides ORDER BY task_type"
+        )
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_model_stats():
+    """Get aggregate model stats for the last 7 days."""
+    try:
+        rows = query(
+            "SELECT "
+            "  COUNT(*) as total_runs, "
+            "  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as total_successes, "
+            "  AVG(CASE WHEN human_rating IS NOT NULL THEN human_rating END) as avg_human_rating "
+            "FROM model_runs "
+            "WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days')"
+        )
+        overall = rows[0] if rows else {"total_runs": 0, "total_successes": 0, "avg_human_rating": None}
+
+        by_model = query(
+            "SELECT model, "
+            "  COUNT(*) as runs, "
+            "  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes, "
+            "  AVG(CASE WHEN human_rating IS NOT NULL THEN human_rating END) as avg_rating, "
+            "  AVG(tokens_used) as avg_tokens "
+            "FROM model_runs "
+            "WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days') "
+            "GROUP BY model ORDER BY runs DESC"
+        )
+
+        return {"overall": overall, "by_model": by_model}
+    except sqlite3.OperationalError:
+        return {"overall": {"total_runs": 0, "total_successes": 0, "avg_human_rating": None}, "by_model": []}
+
+
+def rate_model_run(run_id, rating_data):
+    """Rate a model run and recalculate routing weights."""
+    db = _shared_db()
+    db.execute(
+        "UPDATE model_runs SET "
+        "human_rating = ?, human_notes = ?, code_quality = ?, "
+        "correctness = ?, efficiency = ?, test_quality = ?, "
+        "rated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+        "WHERE id = ?",
+        (
+            rating_data.get("humanRating"),
+            rating_data.get("humanNotes"),
+            rating_data.get("codeQuality"),
+            rating_data.get("correctness"),
+            rating_data.get("efficiency"),
+            rating_data.get("testQuality"),
+            run_id,
+        ),
+    )
+    db.commit()
+
+    # Recalculate routing weights for the affected task_type+language
+    row = query("SELECT task_type, language FROM model_runs WHERE id = ?", (run_id,))
+    if row:
+        task_type = row[0]["task_type"]
+        language = row[0].get("language")
+        _recalculate_weights(task_type, language, db)
+
+
+def _recalculate_weights(task_type, language, db):
+    """Recalculate routing_weights for a given task_type+language combination.
+
+    This is a Python port of the logic in runtime/src/router/weights.ts.
+    """
+    lang_clause = "AND language = ?" if language else ""
+    params = [task_type, language] if language else [task_type]
+
+    rows = db.execute(
+        f"SELECT "
+        f"  model, "
+        f"  COUNT(*) as total_runs, "
+        f"  SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes, "
+        f"  AVG(CASE WHEN human_rating IS NOT NULL THEN human_rating END) as avg_human_rating, "
+        f"  SUM(CASE WHEN human_rating IS NOT NULL THEN 1 ELSE 0 END) as rated_count, "
+        f"  SUM(CASE WHEN ci_passed IS NOT NULL AND ci_passed = 1 THEN 1 ELSE 0 END) as ci_passes, "
+        f"  SUM(CASE WHEN ci_passed IS NOT NULL THEN 1 ELSE 0 END) as ci_total, "
+        f"  SUM(CASE WHEN tests_passed IS NOT NULL AND test_retries = 0 THEN 1 ELSE 0 END) as test_first_passes, "
+        f"  SUM(CASE WHEN tests_passed IS NOT NULL THEN 1 ELSE 0 END) as test_total, "
+        f"  AVG(CASE WHEN pr_review_rounds IS NOT NULL AND pr_review_rounds > 0 THEN pr_review_rounds END) as avg_review_rounds, "
+        f"  SUM(CASE WHEN pr_review_rounds IS NOT NULL AND pr_review_rounds > 0 THEN 1 ELSE 0 END) as review_total, "
+        f"  AVG(tokens_used) as avg_tokens "
+        f"FROM model_runs "
+        f"WHERE task_type = ? {lang_clause} "
+        f"GROUP BY model",
+        params,
+    ).fetchall()
+
+    if not rows:
+        return
+
+    stats = [dict(r) for r in rows]
+    max_tokens = max((s.get("avg_tokens") or 0) for s in stats) or 1
+
+    # Signal weights matching weights.ts
+    W = {
+        "success_rate": 0.25,
+        "human_rating": 0.30,
+        "ci_pass_rate": 0.15,
+        "test_first_pass": 0.10,
+        "review_efficiency": 0.10,
+        "token_efficiency": 0.10,
+    }
+
+    for s in stats:
+        total_runs = s["total_runs"] or 1
+        success_rate = s["successes"] / total_runs
+
+        score = 0.0
+        score += success_rate * W["success_rate"]
+
+        # Human rating
+        if s["rated_count"] and s["rated_count"] > 0 and s["avg_human_rating"] is not None:
+            normalized = (s["avg_human_rating"] - 1) / 4
+            score += normalized * W["human_rating"]
+        else:
+            score += success_rate * W["human_rating"]
+
+        # CI pass rate
+        if s["ci_total"] and s["ci_total"] > 0:
+            score += (s["ci_passes"] / s["ci_total"]) * W["ci_pass_rate"]
+        else:
+            score += success_rate * W["ci_pass_rate"]
+
+        # Test first-pass rate
+        if s["test_total"] and s["test_total"] > 0:
+            score += (s["test_first_passes"] / s["test_total"]) * W["test_first_pass"]
+        else:
+            score += success_rate * W["test_first_pass"]
+
+        # Review efficiency
+        if s["review_total"] and s["review_total"] > 0 and s["avg_review_rounds"] is not None:
+            review_score = max(0, 1 - (s["avg_review_rounds"] - 1) / 4)
+            score += review_score * W["review_efficiency"]
+        else:
+            score += success_rate * W["review_efficiency"]
+
+        # Token efficiency
+        if s["avg_tokens"] is not None and max_tokens > 0:
+            token_score = 1 - (s["avg_tokens"] / max_tokens)
+            score += max(0, token_score) * W["token_efficiency"]
+
+        confidence = min(total_runs / 20, 1.0)
+        lang_val = language if language else "__any__"
+
+        db.execute(
+            "INSERT INTO routing_weights (task_type, language, model, score, confidence, sample_count, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) "
+            "ON CONFLICT(task_type, COALESCE(language, ''), model) DO UPDATE SET "
+            "score = excluded.score, confidence = excluded.confidence, "
+            "sample_count = excluded.sample_count, updated_at = excluded.updated_at",
+            (task_type, lang_val, s["model"], score, confidence, total_runs),
+        )
+
+    db.commit()
 
 
 def build_timeline(ticket, prs, comments, review_runs, ci_fix_runs, audit_runs, doc_runs):
@@ -1280,7 +1495,7 @@ def render_page():
     # Build doc runs HTML
     doc_runs = get_doc_runs()
     completed_docs = [d for d in doc_runs if d.get("status") == "completed" and d.get("pr_url")]
-    running_docs = [d for d in doc_runs if d.get("status") == "running"]
+    running_docs = [d for d in doc_runs if d.get("status") in ("running", "queued")]
     if completed_docs or running_docs:
         doc_rows = ""
         for d in completed_docs:
@@ -1450,6 +1665,266 @@ def render_page():
     if not work_html:
         work_html = '<div style="color:#8b949e;text-align:center;padding:40px 0;font-size:16px;">No active work</div>'
 
+    # Build models tab HTML
+    if _model_tables_exist():
+        unrated_runs = get_unrated_model_runs()
+        routing_weights_data = get_routing_weights()
+        routing_overrides_data = get_routing_overrides()
+        model_stats_data = get_model_stats()
+        models_unrated_count = len(unrated_runs)
+        models_badge_display = "" if models_unrated_count > 0 else "display:none;"
+
+        # Section 1: Unrated runs
+        unrated_section = f'<div class="section"><h2 onclick="toggleModelsSection(\'unrated-section-body\')" style="cursor:pointer;"><span class="badge" style="background:#f39c12">{models_unrated_count}</span> Unrated runs <span id="unrated-section-toggle" style="font-size:12px;color:#8b949e;margin-left:4px;">{"▼" if models_unrated_count > 0 else "▶"}</span></h2>'
+        unrated_section += f'<div id="unrated-section-body" style="{"" if models_unrated_count > 0 else "display:none;"}">'
+
+        if unrated_runs:
+            for run in unrated_runs:
+                run_id = run.get("id", "")
+                ticket_ident = html_mod.escape(run.get("ticket_identifier", "") or "—")
+                skill = html_mod.escape(run.get("skill", ""))
+                model = html_mod.escape(run.get("model", ""))
+                lang = html_mod.escape(run.get("language", "") or "—")
+                complexity = run.get("complexity", "?")
+                success = run.get("success", 0)
+                tests_passed = run.get("tests_passed")
+                ci_passed = run.get("ci_passed")
+                tokens = run.get("tokens_used", 0) or 0
+                duration = run.get("duration_seconds", 0) or 0
+                created = run.get("created_at", "")
+
+                success_icon = "✅" if success else "❌"
+                tests_icon = "✅" if tests_passed == 1 else ("❌" if tests_passed == 0 else "⏳")
+                ci_icon = "✅" if ci_passed == 1 else ("❌" if ci_passed == 0 else "⏳")
+
+                dur_str = f"{duration // 60}m {duration % 60}s" if duration >= 60 else f"{duration}s"
+                tokens_str = f"{tokens:,}" if tokens else "—"
+
+                unrated_section += f'''<div id="run-card-{run_id}" class="model-run-card" style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:8px;">
+                  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px;">
+                    <div>
+                      <span style="font-weight:600;color:#58a6ff;">{ticket_ident}</span>
+                      <span style="color:#8b949e;margin:0 6px;">&middot;</span>
+                      <span style="color:#c9d1d9;">{skill}</span>
+                      <span style="color:#8b949e;margin:0 6px;">&middot;</span>
+                      <span style="color:#d2a8ff;font-family:monospace;font-size:13px;">{model}</span>
+                      <span style="color:#8b949e;margin:0 6px;">&middot;</span>
+                      <span style="color:#8b949e;">{lang} (C{complexity})</span>
+                    </div>
+                    <span class="ts" style="font-size:12px;color:#484f58;">{created}</span>
+                  </div>
+                  <div style="display:flex;gap:16px;align-items:center;margin-bottom:10px;font-size:13px;">
+                    <span title="Success">{success_icon} success</span>
+                    <span title="Tests">{tests_icon} tests</span>
+                    <span title="CI">{ci_icon} CI</span>
+                    <span style="color:#8b949e;">🔢 {tokens_str} tokens</span>
+                    <span style="color:#8b949e;">⏱ {dur_str}</span>
+                  </div>
+                  <div style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap;">
+                    <div>
+                      <div style="font-size:12px;color:#8b949e;margin-bottom:4px;">Overall rating</div>
+                      <div class="star-rating" data-run-id="{run_id}" data-field="main" style="font-size:20px;cursor:pointer;">
+                        <span class="star" data-value="1" onclick="setStarRating(this)">☆</span><span class="star" data-value="2" onclick="setStarRating(this)">☆</span><span class="star" data-value="3" onclick="setStarRating(this)">☆</span><span class="star" data-value="4" onclick="setStarRating(this)">☆</span><span class="star" data-value="5" onclick="setStarRating(this)">☆</span>
+                      </div>
+                    </div>
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                      <div>
+                        <div style="font-size:11px;color:#484f58;margin-bottom:2px;">Code quality</div>
+                        <div class="star-rating" data-run-id="{run_id}" data-field="codeQuality" style="font-size:14px;cursor:pointer;">
+                          <span class="star" data-value="1" onclick="setStarRating(this)">☆</span><span class="star" data-value="2" onclick="setStarRating(this)">☆</span><span class="star" data-value="3" onclick="setStarRating(this)">☆</span><span class="star" data-value="4" onclick="setStarRating(this)">☆</span><span class="star" data-value="5" onclick="setStarRating(this)">☆</span>
+                        </div>
+                      </div>
+                      <div>
+                        <div style="font-size:11px;color:#484f58;margin-bottom:2px;">Correctness</div>
+                        <div class="star-rating" data-run-id="{run_id}" data-field="correctness" style="font-size:14px;cursor:pointer;">
+                          <span class="star" data-value="1" onclick="setStarRating(this)">☆</span><span class="star" data-value="2" onclick="setStarRating(this)">☆</span><span class="star" data-value="3" onclick="setStarRating(this)">☆</span><span class="star" data-value="4" onclick="setStarRating(this)">☆</span><span class="star" data-value="5" onclick="setStarRating(this)">☆</span>
+                        </div>
+                      </div>
+                      <div>
+                        <div style="font-size:11px;color:#484f58;margin-bottom:2px;">Efficiency</div>
+                        <div class="star-rating" data-run-id="{run_id}" data-field="efficiency" style="font-size:14px;cursor:pointer;">
+                          <span class="star" data-value="1" onclick="setStarRating(this)">☆</span><span class="star" data-value="2" onclick="setStarRating(this)">☆</span><span class="star" data-value="3" onclick="setStarRating(this)">☆</span><span class="star" data-value="4" onclick="setStarRating(this)">☆</span><span class="star" data-value="5" onclick="setStarRating(this)">☆</span>
+                        </div>
+                      </div>
+                      <div>
+                        <div style="font-size:11px;color:#484f58;margin-bottom:2px;">Test quality</div>
+                        <div class="star-rating" data-run-id="{run_id}" data-field="testQuality" style="font-size:14px;cursor:pointer;">
+                          <span class="star" data-value="1" onclick="setStarRating(this)">☆</span><span class="star" data-value="2" onclick="setStarRating(this)">☆</span><span class="star" data-value="3" onclick="setStarRating(this)">☆</span><span class="star" data-value="4" onclick="setStarRating(this)">☆</span><span class="star" data-value="5" onclick="setStarRating(this)">☆</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;margin-top:10px;">
+                    <input type="text" id="notes-{run_id}" placeholder="Notes (optional)" style="flex:1;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;" />
+                    <button onclick="submitRating('{run_id}')" style="padding:6px 16px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;cursor:pointer;font-size:13px;">Submit</button>
+                  </div>
+                </div>'''
+        else:
+            unrated_section += '<div style="color:#8b949e;text-align:center;padding:20px 0;">All runs have been rated!</div>'
+
+        unrated_section += '</div></div>'
+
+        # Section 2: Routing weights table
+        weights_section = '<div class="section"><h2>Routing weights</h2>'
+
+        if routing_weights_data:
+            # Group by task_type+language, collect all models
+            all_models = sorted(set(w["model"] for w in routing_weights_data))
+            weight_groups = {}
+            for w in routing_weights_data:
+                lang = w.get("language", "") or ""
+                key = f"{w['task_type']}" + (f" ({lang})" if lang and lang != "__any__" else "")
+                if key not in weight_groups:
+                    weight_groups[key] = {"models": {}, "task_type": w["task_type"], "language": lang}
+                weight_groups[key]["models"][w["model"]] = w
+
+            model_headers = "".join(f'<th style="text-align:center;">{html_mod.escape(m)}</th>' for m in all_models)
+            weights_section += f'''<table>
+              <thead><tr><th>Task type</th>{model_headers}<th style="text-align:center;">Runs</th></tr></thead>
+              <tbody>'''
+
+            for key in sorted(weight_groups.keys()):
+                group = weight_groups[key]
+                cells = f'<td style="font-family:monospace;font-size:13px;">{html_mod.escape(key)}</td>'
+                total_runs = 0
+                # Find winner for this group
+                best_score = -1
+                best_model = None
+                for m in all_models:
+                    if m in group["models"]:
+                        s = group["models"][m]["score"]
+                        if s > best_score:
+                            best_score = s
+                            best_model = m
+
+                for m in all_models:
+                    if m in group["models"]:
+                        w = group["models"][m]
+                        score = w["score"]
+                        count = w.get("sample_count", 0)
+                        total_runs += count
+                        if score > 0.8:
+                            color = "#2ecc71"
+                        elif score >= 0.5:
+                            color = "#f39c12"
+                        else:
+                            color = "#e74c3c"
+                        star = " ★" if m == best_model and len(all_models) > 1 else ""
+                        cells += f'<td style="text-align:center;color:{color};font-weight:600;">{score:.2f}{star}</td>'
+                    else:
+                        cells += '<td style="text-align:center;color:#484f58;">—</td>'
+
+                cells += f'<td style="text-align:center;color:#8b949e;">{total_runs}</td>'
+                weights_section += f'<tr>{cells}</tr>'
+
+            weights_section += '</tbody></table>'
+        else:
+            weights_section += '<div style="color:#8b949e;text-align:center;padding:20px 0;">No routing weights recorded yet.</div>'
+
+        # Override form
+        override_rows = ""
+        for o in routing_overrides_data:
+            o_task = html_mod.escape(o.get("task_type", ""))
+            o_lang = html_mod.escape(o.get("language", "") or "—")
+            o_model = html_mod.escape(o.get("model", ""))
+            o_reason = html_mod.escape(o.get("reason", "") or "—")
+            o_expires = o.get("expires_at", "")
+            o_expires_html = f'<span class="ts">{o_expires}</span>' if o_expires else "Never"
+            o_lang_param = f"&language={o.get('language', '')}" if o.get("language") else ""
+            override_rows += f'''<tr>
+              <td style="font-family:monospace;font-size:13px;">{o_task}</td>
+              <td>{o_lang}</td>
+              <td style="color:#d2a8ff;font-family:monospace;font-size:13px;">{o_model}</td>
+              <td style="color:#8b949e;">{o_reason}</td>
+              <td>{o_expires_html}</td>
+              <td><button onclick="deleteOverride('{o.get("task_type", "")}', '{o.get("language", "")}')" style="font-size:11px;padding:2px 8px;background:#21262d;color:#e74c3c;border:1px solid #30363d;border-radius:4px;cursor:pointer;">✕</button></td>
+            </tr>'''
+
+        weights_section += f'''
+        <div style="margin-top:20px;">
+          <h3 style="font-size:14px;color:#f0f6fc;margin-bottom:12px;">Routing overrides</h3>
+          <table>
+            <thead><tr><th>Task type</th><th>Language</th><th>Model</th><th>Reason</th><th>Expires</th><th></th></tr></thead>
+            <tbody>{override_rows or '<tr><td colspan="6" style="color:#666;text-align:center;">No overrides set</td></tr>'}</tbody>
+          </table>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap;">
+            <input type="text" id="override-task-type" placeholder="Task type" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;width:140px;" />
+            <input type="text" id="override-language" placeholder="Language (optional)" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;width:140px;" />
+            <input type="text" id="override-model" placeholder="Model" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;width:180px;" />
+            <input type="text" id="override-reason" placeholder="Reason (optional)" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;width:180px;" />
+            <input type="date" id="override-expires" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:6px 10px;color:#c9d1d9;font-size:13px;width:140px;" title="Expires at (optional)" />
+            <button onclick="addOverride()" style="padding:6px 16px;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;cursor:pointer;font-size:13px;">Add override</button>
+          </div>
+        </div>'''
+        weights_section += '</div>'
+
+        # Section 3: Recent performance summary
+        stats_section = '<div class="section"><h2>Recent performance (7 days)</h2>'
+
+        overall = model_stats_data.get("overall", {})
+        total_runs_7d = overall.get("total_runs", 0) or 0
+        total_successes_7d = overall.get("total_successes", 0) or 0
+        success_rate_7d = (total_successes_7d / total_runs_7d * 100) if total_runs_7d > 0 else 0
+        avg_rating_7d = overall.get("avg_human_rating")
+        avg_rating_str = f"{avg_rating_7d:.1f}/5" if avg_rating_7d is not None else "—"
+
+        stats_section += f'''<div style="display:flex;gap:24px;margin-bottom:20px;flex-wrap:wrap;">
+          <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 24px;text-align:center;">
+            <div style="font-size:28px;font-weight:700;color:#f0f6fc;">{total_runs_7d}</div>
+            <div style="font-size:12px;color:#8b949e;">Total runs</div>
+          </div>
+          <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 24px;text-align:center;">
+            <div style="font-size:28px;font-weight:700;color:{"#2ecc71" if success_rate_7d >= 80 else ("#f39c12" if success_rate_7d >= 50 else "#e74c3c")};">{success_rate_7d:.0f}%</div>
+            <div style="font-size:12px;color:#8b949e;">Success rate</div>
+          </div>
+          <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px 24px;text-align:center;">
+            <div style="font-size:28px;font-weight:700;color:#f0f6fc;">{avg_rating_str}</div>
+            <div style="font-size:12px;color:#8b949e;">Avg human rating</div>
+          </div>
+        </div>'''
+
+        by_model = model_stats_data.get("by_model", [])
+        if by_model:
+            max_runs_model = max(m.get("runs", 0) or 0 for m in by_model) or 1
+
+            stats_section += '''<table>
+              <thead><tr><th>Model</th><th>Runs</th><th>Success rate</th><th>Avg rating</th><th>Avg tokens</th><th style="width:200px;">Success rate</th></tr></thead>
+              <tbody>'''
+
+            for m in by_model:
+                m_name = html_mod.escape(m.get("model", ""))
+                m_runs = m.get("runs", 0) or 0
+                m_successes = m.get("successes", 0) or 0
+                m_rate = (m_successes / m_runs * 100) if m_runs > 0 else 0
+                m_rating = m.get("avg_rating")
+                m_rating_str = f"{m_rating:.1f}" if m_rating is not None else "—"
+                m_tokens = m.get("avg_tokens")
+                m_tokens_str = f"{int(m_tokens):,}" if m_tokens is not None else "—"
+                bar_width = int(m_rate * 2)  # max 200px
+                bar_color = "#2ecc71" if m_rate >= 80 else ("#f39c12" if m_rate >= 50 else "#e74c3c")
+                rate_color = bar_color
+
+                stats_section += f'''<tr>
+                  <td style="color:#d2a8ff;font-family:monospace;font-size:13px;">{m_name}</td>
+                  <td>{m_runs}</td>
+                  <td style="color:{rate_color};font-weight:600;">{m_rate:.0f}%</td>
+                  <td>{m_rating_str}</td>
+                  <td style="color:#8b949e;">{m_tokens_str}</td>
+                  <td><div style="background:#21262d;border-radius:4px;height:16px;width:200px;overflow:hidden;"><div style="background:{bar_color};height:100%;width:{bar_width}px;border-radius:4px;transition:width 0.3s;"></div></div></td>
+                </tr>'''
+
+            stats_section += '</tbody></table>'
+        else:
+            stats_section += '<div style="color:#8b949e;text-align:center;padding:20px 0;">No model run data in the last 7 days.</div>'
+
+        stats_section += '</div>'
+
+        models_html = unrated_section + weights_section + stats_section
+    else:
+        models_unrated_count = 0
+        models_badge_display = "display:none;"
+        models_html = '<div style="color:#8b949e;text-align:center;padding:40px 0;font-size:16px;">Migration required — run <span style="font-family:monospace;background:#21262d;padding:2px 8px;border-radius:4px;">scripts/migrate.sh</span> to create model_runs tables.</div>'
+
     # Digests: expandable rows with rendered markdown and coverage period
     digests_rows = ""
     for i, d in enumerate(digests):
@@ -1581,6 +2056,51 @@ def render_page():
     .activity-filter {{ font-size: 12px; padding: 4px 12px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 16px; cursor: pointer; }}
     .activity-filter:hover {{ color: #c9d1d9; border-color: #484f58; }}
     .activity-filter.active {{ background: #30363d; color: #f0f6fc; border-color: #484f58; }}
+    /* Star rating */
+    .star-rating .star {{ color: #484f58; transition: color 0.1s; user-select: none; }}
+    .star-rating .star:hover, .star-rating .star.hovered {{ color: #f39c12; }}
+    .star-rating .star.filled {{ color: #f39c12; }}
+    .model-run-card.rated {{ opacity: 0.5; border-color: #2ecc71; }}
+    /* Assist tab styles */
+    .assist-connection-status {{ position: absolute; top: 12px; right: 16px; font-size: 12px; display: flex; align-items: center; gap: 6px; }}
+    .assist-connection-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; }}
+    .assist-section {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }}
+    .assist-section h3 {{ font-size: 14px; color: #f0f6fc; margin-bottom: 12px; }}
+    .assist-form-row {{ display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }}
+    .assist-select {{ background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; color: #c9d1d9; font-size: 13px; min-width: 140px; }}
+    .assist-textarea {{ width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; color: #c9d1d9; font-size: 13px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; resize: vertical; min-height: 80px; }}
+    .assist-btn {{ padding: 6px 16px; background: #238636; color: #fff; border: 1px solid #2ea043; border-radius: 6px; cursor: pointer; font-size: 13px; }}
+    .assist-btn:hover {{ background: #2ea043; }}
+    .assist-btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    .assist-btn-danger {{ background: #b60205; border-color: #da3633; }}
+    .assist-btn-danger:hover {{ background: #da3633; }}
+    .assist-btn-secondary {{ background: #21262d; border-color: #30363d; color: #c9d1d9; }}
+    .assist-btn-secondary:hover {{ background: #30363d; }}
+    .assist-agent-card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }}
+    .assist-agent-header {{ display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid #21262d; }}
+    .assist-agent-header-left {{ display: flex; align-items: center; gap: 8px; }}
+    .assist-agent-status {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }}
+    .assist-agent-status.running {{ background: #0d2818; color: #2ecc71; border: 1px solid #1a4d2e; }}
+    .assist-agent-status.completed {{ background: #21262d; color: #8b949e; }}
+    .assist-agent-status.failed {{ background: #2d0a0a; color: #e74c3c; border: 1px solid #4d1414; }}
+    .assist-output-stream {{ background: #0d1117; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; font-size: 12px; max-height: 400px; overflow-y: auto; padding: 12px; line-height: 1.6; }}
+    .assist-output-entry {{ margin-bottom: 4px; word-break: break-word; white-space: pre-wrap; }}
+    .assist-output-time {{ color: #484f58; }}
+    .assist-output-tool-call {{ color: #58a6ff; }}
+    .assist-output-tool-result {{ color: #2ecc71; }}
+    .assist-output-thinking {{ color: #d2a8ff; }}
+    .assist-output-text {{ color: #c9d1d9; }}
+    .assist-output-error {{ color: #e74c3c; }}
+    .assist-output-expandable {{ cursor: pointer; }}
+    .assist-output-expandable:hover {{ text-decoration: underline; }}
+    .assist-message-row {{ display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #21262d; }}
+    .assist-message-input {{ flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; color: #c9d1d9; font-size: 13px; }}
+    .assist-agent-actions {{ display: flex; gap: 8px; padding: 8px 16px; border-top: 1px solid #21262d; }}
+    .assist-completed-section {{ margin-top: 16px; }}
+    .assist-completed-toggle {{ cursor: pointer; display: flex; align-items: center; gap: 8px; color: #8b949e; font-size: 13px; margin-bottom: 8px; }}
+    .assist-completed-toggle:hover {{ color: #c9d1d9; }}
+    .assist-no-server {{ text-align: center; padding: 40px 20px; color: #8b949e; }}
+    .assist-no-server code {{ background: #21262d; padding: 2px 8px; border-radius: 4px; font-family: monospace; color: #c9d1d9; }}
 </style>
 </head>
 <body>
@@ -1617,9 +2137,11 @@ def render_page():
     <div class="tabs">
         <div class="tab active" data-tab="tickets" onclick="switchTab('tickets')">Tickets</div>
         <div class="tab" data-tab="teammates" onclick="switchTab('teammates')">Teammates ({teammate_count})</div>
+        <div class="tab" data-tab="models" onclick="switchTab('models')">Models <span id="models-unrated-badge" class="badge" style="background:#f39c12;font-size:11px;vertical-align:middle;margin-left:4px;{models_badge_display}">{models_unrated_count}</span></div>
         <div class="tab" data-tab="work" onclick="switchTab('work')">Work ({active_count})</div>
         <div class="tab" data-tab="digests" onclick="switchTab('digests')">Digests</div>
         <div class="tab" data-tab="log" onclick="switchTab('log')">Log</div>
+        <div class="tab" data-tab="assist" onclick="switchTab('assist')">Assist</div>
     </div>
 
     <div id="tickets" class="tab-content active">
@@ -1628,6 +2150,10 @@ def render_page():
 
     <div id="teammates" class="tab-content">
         {teammates_html}
+    </div>
+
+    <div id="models" class="tab-content">
+        {models_html}
     </div>
 
     <div id="work" class="tab-content">
@@ -1648,6 +2174,74 @@ def render_page():
         {activity_feed_html}
     </div>
 
+    <div id="assist" class="tab-content" style="position:relative;">
+        <div class="assist-connection-status">
+            <span id="assist-conn-dot" class="assist-connection-dot" style="background:#e74c3c;"></span>
+            <span id="assist-conn-label" style="color:#8b949e;">Disconnected</span>
+        </div>
+
+        <div id="assist-no-server" class="assist-no-server">
+            <div style="font-size:32px;margin-bottom:16px;">🔌</div>
+            <div style="font-size:16px;color:#f0f6fc;margin-bottom:8px;">Realtime server not connected</div>
+            <div>Start the realtime server to use Assist:</div>
+            <div style="margin-top:12px;"><code>npx tsx runtime/src/realtime/server.ts</code></div>
+        </div>
+
+        <div id="assist-content" style="display:none;">
+            <div class="assist-section">
+                <h3>Spawn agent</h3>
+                <div class="assist-form-row">
+                    <div>
+                        <label style="font-size:12px;color:#8b949e;display:block;margin-bottom:4px;">Skill</label>
+                        <select id="assist-skill" class="assist-select" onchange="assistUpdateArgTemplate()">
+                            <option value="execute">execute</option>
+                            <option value="explore">explore</option>
+                            <option value="review">review</option>
+                            <option value="ci_fix">ci_fix</option>
+                            <option value="audit">audit</option>
+                            <option value="docs">docs</option>
+                            <option value="triage">triage</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="font-size:12px;color:#8b949e;display:block;margin-bottom:4px;">Model</label>
+                        <select id="assist-model" class="assist-select">
+                            <option value="auto">auto</option>
+                            <option value="claude-opus">claude-opus</option>
+                            <option value="gpt5-codex">gpt5-codex</option>
+                            <option value="gemini-pro">gemini-pro</option>
+                        </select>
+                    </div>
+                </div>
+                <div style="margin-bottom:12px;">
+                    <label style="font-size:12px;color:#8b949e;display:block;margin-bottom:4px;">Arguments (JSON)</label>
+                    <textarea id="assist-args" class="assist-textarea">{{
+  "linear_id": "",
+  "identifier": ""
+}}</textarea>
+                </div>
+                <button id="assist-launch-btn" class="assist-btn" onclick="assistLaunchAgent()" disabled>Launch agent</button>
+            </div>
+
+            <div id="assist-running-section">
+                <div class="section" style="margin-bottom:12px;">
+                    <h2>Running agents</h2>
+                </div>
+                <div id="assist-running-agents">
+                    <div style="color:#8b949e;text-align:center;padding:20px 0;">No running agents</div>
+                </div>
+            </div>
+
+            <div id="assist-completed-section" class="assist-completed-section" style="display:none;">
+                <div class="assist-completed-toggle" onclick="assistToggleCompleted()">
+                    <span id="assist-completed-toggle-icon">▶</span>
+                    <span>Completed agents (<span id="assist-completed-count">0</span>)</span>
+                </div>
+                <div id="assist-completed-agents" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
     <div id="drawer-overlay" class="drawer-overlay" onclick="closeDrawer()"></div>
     <div id="ticket-drawer" class="drawer">
         <div class="drawer-header">
@@ -1664,7 +2258,8 @@ def render_page():
         document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
         document.getElementById(name).classList.add('active');
-        event.target.classList.add('active');
+        document.querySelector('.tab[data-tab="' + name + '"]').classList.add('active');
+        if (name === 'assist') {{ assistConnect(); }}
     }}
     // Ticket detail drawer
     var _drawerLinearId = null;
@@ -1977,7 +2572,106 @@ def render_page():
     }}
     localizeTimestamps();
     updateFavicon();
+    // Model rating state — tracks star selections per run before submit
+    var _modelRatings = {{}};
+    function setStarRating(starEl) {{
+        var container = starEl.parentElement;
+        var runId = container.dataset.runId;
+        var field = container.dataset.field;
+        var value = parseInt(starEl.dataset.value);
+        if (!_modelRatings[runId]) _modelRatings[runId] = {{}};
+        _modelRatings[runId][field] = value;
+        // Update star display
+        container.querySelectorAll('.star').forEach(function(s) {{
+            var sv = parseInt(s.dataset.value);
+            s.textContent = sv <= value ? '★' : '☆';
+            s.classList.toggle('filled', sv <= value);
+        }});
+    }}
+    function submitRating(runId) {{
+        var ratings = _modelRatings[runId] || {{}};
+        if (!ratings.main) {{
+            alert('Please select an overall rating (1-5 stars)');
+            return;
+        }}
+        var notesEl = document.getElementById('notes-' + runId);
+        var body = {{
+            humanRating: ratings.main,
+            humanNotes: notesEl ? notesEl.value : null,
+            codeQuality: ratings.codeQuality || null,
+            correctness: ratings.correctness || null,
+            efficiency: ratings.efficiency || null,
+            testQuality: ratings.testQuality || null
+        }};
+        fetch('/api/model-runs/' + runId + '/rate', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(body)
+        }}).then(function(r) {{
+            if (r.ok) {{
+                var card = document.getElementById('run-card-' + runId);
+                if (card) {{
+                    card.classList.add('rated');
+                    card.innerHTML = '<div style="text-align:center;padding:12px;color:#2ecc71;font-size:14px;">✓ Rated ' + ratings.main + '/5</div>';
+                }}
+                // Update unrated badge count
+                var badgeEl = document.getElementById('models-unrated-badge');
+                if (badgeEl) {{
+                    var count = parseInt(badgeEl.textContent) - 1;
+                    badgeEl.textContent = count;
+                    if (count <= 0) badgeEl.style.display = 'none';
+                }}
+                delete _modelRatings[runId];
+            }} else {{
+                alert('Failed to submit rating');
+            }}
+        }}).catch(function() {{
+            alert('Network error submitting rating');
+        }});
+    }}
+    function toggleModelsSection(sectionId) {{
+        var body = document.getElementById(sectionId);
+        if (body) {{
+            var isHidden = body.style.display === 'none';
+            body.style.display = isHidden ? '' : 'none';
+            var toggle = document.getElementById('unrated-section-toggle');
+            if (toggle) toggle.textContent = isHidden ? '▼' : '▶';
+        }}
+    }}
+    function addOverride() {{
+        var taskType = document.getElementById('override-task-type').value.trim();
+        var language = document.getElementById('override-language').value.trim() || null;
+        var model = document.getElementById('override-model').value.trim();
+        var reason = document.getElementById('override-reason').value.trim() || null;
+        var expires = document.getElementById('override-expires').value || null;
+        if (!taskType || !model) {{
+            alert('Task type and model are required');
+            return;
+        }}
+        var body = {{taskType: taskType, model: model}};
+        if (language) body.language = language;
+        if (reason) body.reason = reason;
+        if (expires) body.expiresAt = expires + 'T00:00:00Z';
+        fetch('/api/routing-overrides', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify(body)
+        }}).then(function(r) {{
+            if (r.ok) location.reload();
+            else alert('Failed to add override');
+        }});
+    }}
+    function deleteOverride(taskType, language) {{
+        if (!confirm('Delete override for ' + taskType + '?')) return;
+        var url = '/api/routing-overrides/' + encodeURIComponent(taskType);
+        if (language) url += '?language=' + encodeURIComponent(language);
+        fetch(url, {{method: 'DELETE'}}).then(function(r) {{
+            if (r.ok) location.reload();
+            else alert('Failed to delete override');
+        }});
+    }}
     // Smart auto-refresh: preserve active tab, expanded detail rows, expanded digests, and open drawer
+    // For the models tab, only refresh the unrated badge to avoid losing form state
     setInterval(function() {{
         var activeTab = document.querySelector('.tab-content.active');
         var activeTabId = activeTab ? activeTab.id : 'tickets';
@@ -2010,12 +2704,19 @@ def render_page():
             if (newHb && oldHb) oldHb.outerHTML = newHb.outerHTML;
             // Update favicon status dot
             updateFavicon();
-            // Update each tab content
+            // Update each tab content (skip models and assist to preserve form/ws state)
             ['tickets','teammates','work','digests','log'].forEach(function(id) {{
                 var newEl = doc.getElementById(id);
                 var oldEl = document.getElementById(id);
                 if (newEl && oldEl) oldEl.innerHTML = newEl.innerHTML;
             }});
+            // Update models unrated badge without replacing tab content
+            var newBadge = doc.getElementById('models-unrated-badge');
+            var oldBadge = document.getElementById('models-unrated-badge');
+            if (newBadge && oldBadge) {{
+                oldBadge.textContent = newBadge.textContent;
+                oldBadge.style.display = newBadge.style.display;
+            }}
             // Restore active tab
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
@@ -2059,6 +2760,417 @@ def render_page():
             }}
         }}).catch(function() {{}});
     }}, 60000);
+
+    // ===== Assist tab: WebSocket-based agent interaction =====
+    var _assistWs = null;
+    var _assistReconnectTimer = null;
+    var _assistReconnectDelay = 1000;
+    var _assistMaxReconnectDelay = 30000;
+    var _assistConnected = false;
+    var _assistAgents = {{}};  // agentId -> {{ skill, model, status, startedAt, entries[], turns, tokens }}
+    var _assistCompletedAgents = {{}};
+    var _assistTabActive = false;
+
+    var _assistArgTemplates = {{
+        execute: '{{\\n  "linear_id": "",\\n  "identifier": ""\\n}}',
+        explore: '{{\\n  "linear_id": "",\\n  "identifier": ""\\n}}',
+        review: '{{\\n  "linear_id": "",\\n  "identifier": "",\\n  "pr_number": ""\\n}}',
+        ci_fix: '{{\\n  "pr_number": "",\\n  "repo": ""\\n}}',
+        audit: '{{\\n  "pr_number": "",\\n  "repo": ""\\n}}',
+        docs: '{{\\n  "ticket_identifier": "",\\n  "repo": ""\\n}}',
+        triage: '{{\\n  "linear_id": "",\\n  "identifier": ""\\n}}'
+    }};
+
+    function assistUpdateArgTemplate() {{
+        var skill = document.getElementById('assist-skill').value;
+        var template = _assistArgTemplates[skill] || '{{}}';
+        document.getElementById('assist-args').value = template;
+    }}
+
+    function assistConnect() {{
+        if (_assistWs && (_assistWs.readyState === WebSocket.CONNECTING || _assistWs.readyState === WebSocket.OPEN)) {{
+            return;
+        }}
+        assistSetConnectionStatus('connecting');
+        try {{
+            _assistWs = new WebSocket('ws://localhost:7780');
+        }} catch (e) {{
+            assistSetConnectionStatus('disconnected');
+            assistScheduleReconnect();
+            return;
+        }}
+
+        _assistWs.onopen = function() {{
+            _assistConnected = true;
+            _assistReconnectDelay = 1000;
+            assistSetConnectionStatus('connected');
+            document.getElementById('assist-no-server').style.display = 'none';
+            document.getElementById('assist-content').style.display = '';
+            document.getElementById('assist-launch-btn').disabled = false;
+        }};
+
+        _assistWs.onclose = function() {{
+            _assistConnected = false;
+            assistSetConnectionStatus('disconnected');
+            document.getElementById('assist-launch-btn').disabled = true;
+            if (_assistTabActive) {{
+                assistScheduleReconnect();
+            }}
+        }};
+
+        _assistWs.onerror = function() {{
+            // onclose will fire after this
+        }};
+
+        _assistWs.onmessage = function(event) {{
+            try {{
+                var msg = JSON.parse(event.data);
+                assistHandleMessage(msg);
+            }} catch (e) {{
+                // ignore malformed messages
+            }}
+        }};
+    }}
+
+    function assistDisconnect() {{
+        if (_assistReconnectTimer) {{
+            clearTimeout(_assistReconnectTimer);
+            _assistReconnectTimer = null;
+        }}
+        if (_assistWs) {{
+            _assistWs.onclose = null;
+            _assistWs.close();
+            _assistWs = null;
+        }}
+        _assistConnected = false;
+    }}
+
+    function assistScheduleReconnect() {{
+        if (_assistReconnectTimer) return;
+        _assistReconnectTimer = setTimeout(function() {{
+            _assistReconnectTimer = null;
+            if (_assistTabActive) {{
+                assistConnect();
+            }}
+        }}, _assistReconnectDelay);
+        _assistReconnectDelay = Math.min(_assistReconnectDelay * 2, _assistMaxReconnectDelay);
+    }}
+
+    function assistSetConnectionStatus(status) {{
+        var dot = document.getElementById('assist-conn-dot');
+        var label = document.getElementById('assist-conn-label');
+        var noServer = document.getElementById('assist-no-server');
+        var content = document.getElementById('assist-content');
+        if (!dot || !label) return;
+        if (status === 'connected') {{
+            dot.style.background = '#2ecc71';
+            label.textContent = 'Connected';
+            label.style.color = '#2ecc71';
+        }} else if (status === 'connecting') {{
+            dot.style.background = '#f39c12';
+            label.textContent = 'Connecting…';
+            label.style.color = '#f39c12';
+        }} else {{
+            dot.style.background = '#e74c3c';
+            label.textContent = 'Disconnected';
+            label.style.color = '#8b949e';
+            if (noServer && content) {{
+                // Only show no-server if we have no running agents
+                if (Object.keys(_assistAgents).length === 0) {{
+                    noServer.style.display = '';
+                    content.style.display = 'none';
+                }}
+            }}
+        }}
+    }}
+
+    function assistHandleMessage(msg) {{
+        var agentId = msg.agentId;
+        if (!agentId) return;
+
+        if (msg.type === 'agent_started') {{
+            _assistAgents[agentId] = {{
+                skill: msg.skill || '?',
+                model: msg.model || 'auto',
+                status: 'running',
+                startedAt: new Date(),
+                entries: [],
+                turns: 0,
+                tokens: 0
+            }};
+            assistRenderAgents();
+            return;
+        }}
+
+        if (msg.type === 'agent_completed' || msg.type === 'agent_failed') {{
+            var agent = _assistAgents[agentId];
+            if (agent) {{
+                agent.status = msg.type === 'agent_completed' ? 'completed' : 'failed';
+                agent.turns = msg.turns || agent.turns;
+                agent.tokens = msg.tokens || agent.tokens;
+                _assistCompletedAgents[agentId] = agent;
+                delete _assistAgents[agentId];
+                assistRenderAgents();
+                assistRenderCompleted();
+            }}
+            return;
+        }}
+
+        // Stream entries: tool_call, tool_result, thinking, text, error
+        var agent = _assistAgents[agentId];
+        if (!agent) return;
+
+        var entry = {{
+            time: new Date(),
+            type: msg.type || 'text',
+            content: ''
+        }};
+
+        if (msg.type === 'tool_call') {{
+            var argsPreview = (msg.args || '').substring(0, 100);
+            if ((msg.args || '').length > 100) argsPreview += '…';
+            entry.content = msg.tool + (argsPreview ? '\\n  ' + argsPreview : '');
+            if (msg.turns) agent.turns = msg.turns;
+        }} else if (msg.type === 'tool_result') {{
+            var size = msg.size || '?';
+            entry.content = '(' + size + ')';
+        }} else if (msg.type === 'thinking') {{
+            var preview = (msg.content || '').substring(0, 200);
+            var full = msg.content || '';
+            entry.content = preview;
+            if (full.length > 200) {{
+                entry.content += '…';
+                entry.fullContent = full;
+            }}
+        }} else if (msg.type === 'text') {{
+            var preview = (msg.content || '').substring(0, 200);
+            var full = msg.content || '';
+            entry.content = preview;
+            if (full.length > 200) {{
+                entry.content += '…';
+                entry.fullContent = full;
+            }}
+        }} else if (msg.type === 'error') {{
+            entry.content = msg.content || 'Unknown error';
+        }}
+
+        if (msg.tokens) agent.tokens = msg.tokens;
+        agent.entries.push(entry);
+        assistRenderStreamEntry(agentId, entry);
+    }}
+
+    function assistFormatTime(d) {{
+        return d.toLocaleTimeString(undefined, {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+    }}
+
+    function assistTimeSince(d) {{
+        var diff = Math.floor((new Date() - d) / 1000);
+        if (diff < 60) return diff + 's ago';
+        var mins = Math.floor(diff / 60);
+        if (mins < 60) return mins + 'm ago';
+        var hrs = Math.floor(mins / 60);
+        return hrs + 'h ' + (mins % 60) + 'm ago';
+    }}
+
+    function assistEntryIcon(type) {{
+        var icons = {{tool_call: '🔧', tool_result: '✅', thinking: '💭', text: '📝', error: '❌'}};
+        return icons[type] || '•';
+    }}
+
+    function assistEntryClass(type) {{
+        var classes = {{tool_call: 'assist-output-tool-call', tool_result: 'assist-output-tool-result', thinking: 'assist-output-thinking', text: 'assist-output-text', error: 'assist-output-error'}};
+        return classes[type] || 'assist-output-text';
+    }}
+
+    function assistRenderAgents() {{
+        var container = document.getElementById('assist-running-agents');
+        if (!container) return;
+        var ids = Object.keys(_assistAgents);
+        if (ids.length === 0) {{
+            container.innerHTML = '<div style="color:#8b949e;text-align:center;padding:20px 0;">No running agents</div>';
+            return;
+        }}
+        var html = '';
+        ids.forEach(function(id) {{
+            var a = _assistAgents[id];
+            var shortId = id.length > 10 ? id.substring(0, 10) : id;
+            var since = assistTimeSince(a.startedAt);
+            html += '<div class="assist-agent-card" id="assist-card-' + escapeHtml(id) + '">';
+            html += '<div class="assist-agent-header">';
+            html += '<div class="assist-agent-header-left">';
+            html += '<span style="font-weight:600;color:#58a6ff;font-family:monospace;font-size:13px;">' + escapeHtml(shortId) + '</span>';
+            html += '<span style="color:#8b949e;">(' + escapeHtml(a.skill) + ', ' + escapeHtml(a.model) + ')</span>';
+            html += '</div>';
+            html += '<div style="display:flex;align-items:center;gap:8px;">';
+            html += '<span class="assist-agent-status running">running</span>';
+            html += '<span style="color:#484f58;font-size:12px;">Started: ' + escapeHtml(since) + '</span>';
+            html += '</div>';
+            html += '</div>';
+            html += '<div class="assist-output-stream" id="assist-stream-' + escapeHtml(id) + '">';
+            a.entries.forEach(function(entry) {{
+                html += assistRenderEntryHtml(entry);
+            }});
+            html += '</div>';
+            html += '<div class="assist-message-row">';
+            html += '<input type="text" class="assist-message-input" id="assist-msg-' + escapeHtml(id) + '" placeholder="Send message…" onkeydown="if(event.key===\'Enter\')assistSendMessage(\'' + escapeHtml(id) + '\')" />';
+            html += '<button class="assist-btn assist-btn-secondary" onclick="assistSendMessage(\'' + escapeHtml(id) + '\')">Send</button>';
+            html += '</div>';
+            html += '<div class="assist-agent-actions">';
+            html += '<button class="assist-btn assist-btn-danger" onclick="assistInterrupt(\'' + escapeHtml(id) + '\')">Interrupt</button>';
+            html += '</div>';
+            html += '</div>';
+        }});
+        container.innerHTML = html;
+        // Auto-scroll all streams to bottom
+        ids.forEach(function(id) {{
+            var stream = document.getElementById('assist-stream-' + id);
+            if (stream) stream.scrollTop = stream.scrollHeight;
+        }});
+    }}
+
+    function assistRenderEntryHtml(entry) {{
+        var icon = assistEntryIcon(entry.type);
+        var cls = assistEntryClass(entry.type);
+        var timeStr = assistFormatTime(entry.time);
+        var content = escapeHtml(entry.content);
+        var expandAttr = '';
+        if (entry.fullContent) {{
+            expandAttr = ' class="assist-output-entry assist-output-expandable" onclick="this.textContent=this.dataset.full;this.classList.remove(\'assist-output-expandable\')" data-full="' + escapeHtml('[' + timeStr + '] ' + icon + ' ' + entry.type + ': ' + entry.fullContent).replace(/"/g, '&quot;') + '"';
+        }} else {{
+            expandAttr = ' class="assist-output-entry"';
+        }}
+        return '<div' + expandAttr + '><span class="assist-output-time">[' + escapeHtml(timeStr) + ']</span> ' + icon + ' <span class="' + cls + '">' + content + '</span></div>';
+    }}
+
+    function assistRenderStreamEntry(agentId, entry) {{
+        var stream = document.getElementById('assist-stream-' + agentId);
+        if (!stream) {{
+            assistRenderAgents();
+            return;
+        }}
+        var div = document.createElement('div');
+        div.innerHTML = assistRenderEntryHtml(entry);
+        var entryEl = div.firstChild;
+        stream.appendChild(entryEl);
+        // Auto-scroll if near bottom
+        var atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 60;
+        if (atBottom) stream.scrollTop = stream.scrollHeight;
+    }}
+
+    function assistRenderCompleted() {{
+        var ids = Object.keys(_assistCompletedAgents);
+        var section = document.getElementById('assist-completed-section');
+        var container = document.getElementById('assist-completed-agents');
+        var countEl = document.getElementById('assist-completed-count');
+        if (!section || !container || !countEl) return;
+        countEl.textContent = ids.length;
+        if (ids.length === 0) {{
+            section.style.display = 'none';
+            return;
+        }}
+        section.style.display = '';
+        var html = '';
+        ids.reverse().forEach(function(id) {{
+            var a = _assistCompletedAgents[id];
+            var shortId = id.length > 10 ? id.substring(0, 10) : id;
+            var statusClass = a.status === 'completed' ? 'completed' : 'failed';
+            var statusIcon = a.status === 'completed' ? '✅' : '❌';
+            var tokensStr = a.tokens ? a.tokens.toLocaleString() : '—';
+            html += '<div class="assist-agent-card" style="opacity:0.7;">';
+            html += '<div class="assist-agent-header">';
+            html += '<div class="assist-agent-header-left">';
+            html += '<span style="font-weight:600;color:#8b949e;font-family:monospace;font-size:13px;">' + escapeHtml(shortId) + '</span>';
+            html += '<span style="color:#484f58;">(' + escapeHtml(a.skill) + ', ' + escapeHtml(a.model) + ')</span>';
+            html += '</div>';
+            html += '<div style="display:flex;align-items:center;gap:8px;">';
+            html += '<span class="assist-agent-status ' + statusClass + '">' + statusIcon + ' ' + escapeHtml(a.status) + '</span>';
+            html += '<span style="color:#484f58;font-size:12px;">' + (a.turns || 0) + ' turns · ' + tokensStr + ' tokens</span>';
+            html += '</div>';
+            html += '</div>';
+            html += '</div>';
+        }});
+        container.innerHTML = html;
+    }}
+
+    function assistToggleCompleted() {{
+        var container = document.getElementById('assist-completed-agents');
+        var icon = document.getElementById('assist-completed-toggle-icon');
+        if (!container || !icon) return;
+        var hidden = container.style.display === 'none';
+        container.style.display = hidden ? '' : 'none';
+        icon.textContent = hidden ? '▼' : '▶';
+    }}
+
+    function assistLaunchAgent() {{
+        if (!_assistConnected || !_assistWs) return;
+        var skill = document.getElementById('assist-skill').value;
+        var model = document.getElementById('assist-model').value;
+        var argsStr = document.getElementById('assist-args').value.trim();
+        var args;
+        try {{
+            args = JSON.parse(argsStr);
+        }} catch (e) {{
+            alert('Invalid JSON in arguments');
+            return;
+        }}
+        _assistWs.send(JSON.stringify({{
+            type: 'spawn',
+            skill: skill,
+            args: args,
+            model: model
+        }}));
+    }}
+
+    function assistSendMessage(agentId) {{
+        if (!_assistConnected || !_assistWs) return;
+        var input = document.getElementById('assist-msg-' + agentId);
+        if (!input) return;
+        var content = input.value.trim();
+        if (!content) return;
+        _assistWs.send(JSON.stringify({{
+            type: 'message',
+            agentId: agentId,
+            content: content
+        }}));
+        input.value = '';
+    }}
+
+    function assistInterrupt(agentId) {{
+        if (!confirm('Interrupt agent ' + agentId.substring(0, 10) + '?')) return;
+        if (!_assistConnected || !_assistWs) return;
+        _assistWs.send(JSON.stringify({{
+            type: 'interrupt',
+            agentId: agentId
+        }}));
+    }}
+
+    // Watch for tab switches to manage WebSocket lifecycle
+    var _origSwitchTab = switchTab;
+    switchTab = function(name) {{
+        _origSwitchTab(name);
+        _assistTabActive = (name === 'assist');
+        if (_assistTabActive) {{
+            if (!_assistConnected) {{
+                assistConnect();
+            }}
+        }}
+    }};
+
+    // Update assist agent "started X ago" timestamps periodically
+    setInterval(function() {{
+        if (!_assistTabActive) return;
+        Object.keys(_assistAgents).forEach(function(id) {{
+            var card = document.getElementById('assist-card-' + id);
+            if (!card) return;
+            var a = _assistAgents[id];
+            var since = assistTimeSince(a.startedAt);
+            var startedSpans = card.querySelectorAll('.assist-agent-header span[style*="color:#484f58"]');
+            if (startedSpans.length > 0) {{
+                startedSpans[startedSpans.length - 1].textContent = 'Started: ' + since;
+            }}
+        }});
+    }}, 10000);
+
     </script>
 </body>
 </html>"""
@@ -2127,6 +3239,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps(data).encode())
+        elif self.path == "/api/model-runs/unrated":
+            data = get_unrated_model_runs()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        elif self.path == "/api/model-runs/recent":
+            data = get_recent_model_runs()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        elif self.path == "/api/routing-weights":
+            data = get_routing_weights()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        elif self.path == "/api/routing-overrides":
+            data = get_routing_overrides()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        elif self.path == "/api/model-stats":
+            data = get_model_stats()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -2196,6 +3338,108 @@ class Handler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, Exception):
                 self.send_response(500)
                 self.end_headers()
+        elif self.path.startswith("/api/model-runs/") and self.path.endswith("/rate"):
+            # POST /api/model-runs/{id}/rate
+            run_id = self.path[len("/api/model-runs/"):-len("/rate")]
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+                human_rating = data.get("humanRating")
+                if not human_rating or not isinstance(human_rating, int) or human_rating < 1 or human_rating > 5:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "humanRating must be 1-5"}).encode())
+                    return
+                rate_model_run(run_id, data)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+            except (json.JSONDecodeError, Exception) as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == "/api/routing-overrides":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+                task_type = data.get("taskType", "").strip()
+                model = data.get("model", "").strip()
+                if not task_type or not model:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "taskType and model are required"}).encode())
+                    return
+                language = data.get("language", "").strip() or None
+                reason = data.get("reason", "").strip() or None
+                expires_at = data.get("expiresAt", "").strip() or None
+                db = _shared_db()
+                db.execute(
+                    "INSERT OR REPLACE INTO routing_overrides "
+                    "(task_type, language, model, reason, created_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?)",
+                    (task_type, language, model, reason, expires_at),
+                )
+                db.commit()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+            except (json.JSONDecodeError, Exception) as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_DELETE(self):
+        try:
+            self._handle_delete()
+        finally:
+            _close_shared_db()
+
+    def _handle_delete(self):
+        if self.path.startswith("/api/routing-overrides/"):
+            # DELETE /api/routing-overrides/{task_type}?language=...
+            path_and_query = self.path[len("/api/routing-overrides/"):]
+            # Parse query params
+            if "?" in path_and_query:
+                task_type_raw, qs = path_and_query.split("?", 1)
+                params = parse_qs(qs)
+                language = params.get("language", [None])[0]
+            else:
+                task_type_raw = path_and_query
+                language = None
+            task_type = unquote(task_type_raw)
+            try:
+                db = _shared_db()
+                if language:
+                    db.execute(
+                        "DELETE FROM routing_overrides WHERE task_type = ? AND language = ?",
+                        (task_type, language),
+                    )
+                else:
+                    db.execute(
+                        "DELETE FROM routing_overrides WHERE task_type = ? AND language IS NULL",
+                        (task_type,),
+                    )
+                db.commit()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
         else:
             self.send_response(404)
             self.end_headers()

@@ -1,10 +1,77 @@
-# /marvin-review — Address PR review feedback
+<!-- Generated from skills/review.md by harness/claude-code.ts — DO NOT EDIT DIRECTLY -->
+# /marvin-review — address PR review feedback
+
 
 You are a teammate agent addressing PR review comments on an existing draft PR. You work in the existing worktree, make targeted changes responding to reviewer feedback, push additional commits, and reply to each comment via the GitHub API.
 
+## Safety invariants
+
+- Never create tickets in Linear — only update existing ones (comments, state changes, assignments)
+- Never merge PRs — always create as draft, undraft only when CI passes and review comments are addressed
+- Auto-approval only for risk:low PRs with passing CI (via audit workers)
+- Never deploy anything
+- Never modify main directly on target repos — always use worktrees branching from `origin/main`
+- Always push with explicit refspec (`HEAD:refs/heads/<branch>`) — never rely on upstream tracking
+- Always unset upstream tracking on new worktree branches to prevent accidental push to main
+- Branch safety re-check before every commit/push in all worker skills
+- Never force push
+- Never read .env files
+- Human review is always required before merging (except risk:low auto-approvals)
+
+## State management
+
+- SQLite database at `~/.marvin/state/marvin.db`
+- Schema managed via numbered migrations in `schema/migrations/` — run `scripts/migrate.sh`
+- All timestamps use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — never `datetime('now')`
+
+### Database tables
+
+| Table | Purpose |
+|-------|---------|
+| `tickets` | Core ticket tracking, triage results, execution status, PR info, defer fields |
+| `pull_requests` | All open PRs, CI/review/audit status, merge conflict detection, auto-rebase tracking |
+| `review_comments` | Individual PR review comments with addressing status |
+| `review_runs` | Review processing sessions |
+| `ci_fix_runs` | CI fix attempt tracking per PR |
+| `audit_runs` | Audit attempt tracking per PR, with `findings_json` |
+| `doc_runs` | Documentation follow-up PR tracking |
+| `heartbeat` | Singleton row: orchestrator liveness (cycle number, current step, last beat) |
+| `cycle_events` | Per-cycle event log for dashboard activity (capped at 500 rows) |
+
+## Worker types
+
+| Role | Skill | Spawned by | What it does |
+|------|-------|-----------|--------------|
+| Executor | `execute` | phase-triage | Explore → plan → implement → test → commit → push → draft PR |
+| Explorer | `explore` | phase-triage | Investigate codebase → post findings to Linear (complexity ≥ 3, no implementation) |
+| Docs | `docs` | phase-pr | Read executor knowledge → update CLAUDE.md/READMEs → docs PR |
+| Reviewer | `review` | phase-pr | Sync worktree → address review comments → commit → push |
+| CI fixer | `ci_fix` | phase-pr | Investigate CI failure → fix → test → push |
+| Auditor | `audit` | phase-pr | Classify size → architectural review → risk assess → label/approve |
+
+## Worktree conventions
+
+- Root: `<worktree_root from config>`
+- Implementation branches: `<branch_prefix from config>/gm-{ticket_number}-{slug}`
+- Documentation branches: `<branch_prefix from config>/docs-{identifier}`
+- Always branch from `origin/main` after `git fetch origin main`
+- Always unset upstream tracking after worktree creation
+- Cleanup: `scripts/cleanup-worktrees.sh [--dry-run]`
+
+## Git conventions
+
+- Always push with explicit refspec: `git push -u origin HEAD:refs/heads/<branch_name>`
+- Never rely on upstream tracking — always use explicit refspec
+- Always unset upstream on new worktree branches: `git branch --unset-upstream "$BRANCH" 2>/dev/null || true`
+- Branch safety re-check before every commit/push phase
+
+## Repo mappings
+
+Repos are configured in `config.json` under the `repos` key. Each entry maps a repo name to its local path.
 ## Input
 
 You will receive these arguments from the orchestrator:
+
 - `linear_id`: Linear issue UUID
 - `identifier`: e.g. GM-1234
 - `pr_number`: GitHub PR number
@@ -30,49 +97,21 @@ sqlite3 ~/.marvin/state/marvin.db "
 
 **CRITICAL**: You MUST run this checkpoint SQL at the start of EVERY phase below. The ops phase uses `last_phase` to detect stuck workers. If you don't update these, your run will be reaped as stale after 60 minutes even if you're still working.
 
-## Phase 1: Sync worktree
+## Workflow
 
-**Run checkpoint**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'sync-worktree', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase sync-worktree');
-"
-```
+### Phase 1: Sync worktree
+
 
 ```bash
 cd <worktree_path>
-```
-
-**Branch safety check** — before doing ANY work, verify you're on a feature branch, not main:
-```bash
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-  echo "FATAL: On branch $CURRENT_BRANCH — refusing to proceed."
-  exit 1
-fi
-```
-If this check fails, mark the review run as failed with error "Worktree was on main branch" and stop immediately.
-
-Then sync:
-```bash
 git fetch origin <branch_name>
 git pull origin <branch_name>
 ```
 
-## Phase 2: Understand context
+### Phase 2: Understand context
 
-**Run checkpoint**:
+1. **Read the PR diff**:
 ```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'understand-context', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase understand-context');
-"
-```
-
-1. **Read the PR diff** to understand the full scope of changes:
-```bash
-cd <worktree_path>
 gh pr diff <pr_number> --repo <repo>
 ```
 
@@ -81,9 +120,9 @@ gh pr diff <pr_number> --repo <repo>
 gh pr view <pr_number> --repo <repo> --json body,title
 ```
 
-3. **Read the repo's `.claude/CLAUDE.md`** for conventions.
+3. **Read the repo's `.claude/CLAUDE.md`** for conventions
 
-4. **Read the review comments** from the JSON file at `<comments_json_path>`. Each comment has:
+4. **Read review comments** from `<comments_json_path>`. Each comment has:
    - `comment_id`: GitHub comment ID
    - `author`: who left the comment
    - `body`: the comment text
@@ -91,94 +130,56 @@ gh pr view <pr_number> --repo <repo> --json body,title
    - `line`: line number (null for top-level)
    - `thread_node_id`: GraphQL node ID for the thread
 
-## Phase 3: Address each comment
+### Phase 3: Address each comment
 
-**Run checkpoint**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'address-comments', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase address-comments');
-"
-```
+For each comment, categorize and act:
 
-For each comment, decide:
-
-### No code change needed
+#### No change needed
 If the comment is a question, acknowledgment, or the code is already correct:
-- Reply explaining your reasoning via the GitHub API:
+- Reply explaining reasoning:
 ```bash
 gh api repos/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
-  -f body="<response explaining reasoning>"
+  -f body="<response>"
 ```
-- Then **resolve the thread**:
+- **Resolve the thread**:
 ```bash
 gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<thread_node_id>"}) { thread { isResolved } } }'
 ```
 
-### Code change needed
+#### Code change needed
 If the reviewer is requesting a change:
-1. **Read the relevant file(s)** in the worktree
-2. **Make the change** using Edit/Write tools
-3. **Track the change** for the commit message
-4. **Reply to the comment** describing what you changed:
+1. Read the relevant file(s) in the worktree
+2. Make the change using Edit/Write tools
+3. Track the change for the commit message
+4. Reply describing what changed:
 ```bash
 gh api repos/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
-  -f body="Fixed — <brief description of what changed>. See upcoming commit."
+  -f body="Fixed — <brief description>. See upcoming commit."
 ```
-5. **Resolve the thread**:
-```bash
-gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<thread_node_id>"}) { thread { isResolved } } }'
-```
+5. **Resolve the thread**
 
-### Out of scope
+#### Out of scope
 If the comment requests an architectural change beyond the PR's scope:
 ```bash
 gh api repos/<repo>/pulls/<pr_number>/comments/<comment_id>/replies \
   -f body="This is outside the scope of this PR. It would be better addressed in a separate ticket."
 ```
-Mark the comment as `skipped` in the state DB. **Do not resolve out-of-scope threads** — leave them open for the reviewer to handle.
+Mark as `skipped` in state DB. **Do NOT resolve out-of-scope threads** — leave them for the reviewer.
 
-## Phase 4: Test
+### Phase 4: Test
 
-**Run checkpoint**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'test', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase test');
-"
-```
+Run relevant tests after all changes:
+- Go: `cd <worktree_path>/<app_dir> && go test ./...`
+- Ruby: `cd <worktree_path>/<app_dir> && bundle exec rspec`
+- Terraform: `cd <worktree_path> && terraform fmt && terraform validate`
 
-After making all changes, run the relevant tests:
-- For Go: `cd <worktree_path>/<app_dir> && go test ./...`
-- For Ruby: `cd <worktree_path>/<app_dir> && bundle exec rspec`
-- For Terraform: `cd <worktree_path> && terraform fmt && terraform validate`
+Fix test failures before proceeding.
 
-If tests fail, fix them before proceeding.
+### Phase 5: Commit and push
 
-## Phase 5: Commit and push
-
-**Run checkpoint**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'commit-push', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase commit-push');
-"
-```
 
 If any code changes were made:
 
-**Branch safety re-check** — verify you're still on the feature branch before committing:
-```bash
-cd <worktree_path>
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-  echo "FATAL: On branch $CURRENT_BRANCH — refusing to commit/push."
-  sqlite3 ~/.marvin/state/marvin.db "UPDATE review_runs SET status = 'failed', error = 'Branch safety: was on main at commit time' WHERE ticket_linear_id = '<linear_id>' AND status = 'running';"
-  exit 1
-fi
-```
-
-1. **Stage and commit**:
 ```bash
 cd <worktree_path>
 git add -A
@@ -190,27 +191,12 @@ Address PR review feedback
 Co-Authored-By: Marvin (Claude Code) <noreply@anthropic.com>
 EOF
 )"
-```
-
-2. **Push** (explicit refspec, never force-push):
-```bash
 git push origin HEAD:refs/heads/<branch_name>
 ```
 
-3. **Capture the commit SHA**:
-```bash
-git rev-parse HEAD
-```
+Capture commit SHA: `git rev-parse HEAD`
 
-## Phase 6: Update state DB
-
-**Run checkpoint**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs SET last_phase = 'update-db', last_phase_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE ticket_linear_id = '<linear_id>' AND status = 'running';
-  INSERT INTO cycle_events (cycle_number, step, message) VALUES ((SELECT cycle_number FROM heartbeat WHERE id = 1), 'worker', '<identifier> reviewer: entering phase update-db');
-"
-```
+### Phase 6: Update state DB
 
 1. **Mark comments as addressed/skipped**:
 ```bash
@@ -238,7 +224,7 @@ sqlite3 ~/.marvin/state/marvin.db "
 "
 ```
 
-3. **Reset the ticket's review status**:
+3. **Reset ticket review status**:
 ```bash
 sqlite3 ~/.marvin/state/marvin.db "
   UPDATE tickets
@@ -250,17 +236,15 @@ sqlite3 ~/.marvin/state/marvin.db "
 
 ## Safety rules
 
-- **Never commit or push to `main`** — always verify you're on a feature branch before any git operations
-- **Never force-push** — only regular `git push`
-- **Never merge the PR** — leave it as a draft
-- **Always resolve review threads** after replying — except for out-of-scope comments (leave those open for the reviewer)
-- **Never modify files outside the scope of the review comments** — don't refactor unrelated code
-- **Never create Linear tickets** — only update existing ones
-- If a comment is ambiguous or requests something you can't safely do, reply asking for clarification and mark as `skipped`
+- Never modify files outside the scope of review comments
+- Never force-push — only regular `git push`
+- Never merge the PR — leave it as-is
+- Always resolve threads after replying — except out-of-scope (leave open)
+- If a comment is ambiguous or unsafe, reply asking for clarification and mark as `skipped`
 
 ## Error handling
 
-If any phase fails:
-1. Update the review run: `status = 'failed'`, `error = '<description>'`
-2. Leave ticket `review_status` as-is so the orchestrator retries next cycle
-3. Report the error back to the orchestrator
+On failure:
+1. Update review run: `status = 'failed'`, `error = '<description>'`
+2. Leave ticket `review_status` as-is so orchestrator retries next cycle
+3. Report error to orchestrator
