@@ -11,7 +11,7 @@
   "worktree_root": "/path/to/worktrees",
   "complexity_threshold": 2,
   "confidence_threshold": 0.7,
-  "digest_interval_minutes": 60,
+  "digest_interval_minutes": 120,
   "state_db": "~/.marvin/state/marvin.db",
   "log_dir": "~/.marvin/logs",
   "backup_dir": "~/.marvin/backups",
@@ -46,5 +46,17 @@
     "stale_docs_minutes": 30,
     "rebase_max_attempts": 3,
     "rebase_min_interval_minutes": 10
+  },
+
+  "routing": {
+    "providers": {
+      "claude-opus": { "litellm_model": "anthropic/claude-opus-4", "enabled": true },
+      "gpt5-codex": { "litellm_model": "openai/gpt-5-codex", "enabled": true },
+      "gemini-pro": { "litellm_model": "google/gemini-2.5-pro", "enabled": true },
+      "claude-sonnet": { "litellm_model": "anthropic/claude-sonnet-4", "enabled": true },
+      "gpt4o": { "litellm_model": "openai/gpt-4o", "enabled": true }
+    },
+    "min_runs_for_learned_routing": 5,
+    "confidence_threshold": 0.7
   }
 }

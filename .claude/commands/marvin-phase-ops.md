@@ -1,321 +1,302 @@
-# /marvin-phase-ops — Housekeeping phase
+<!-- Generated from skills/phase-ops.md by harness/claude-code.ts — DO NOT EDIT DIRECTLY -->
+# /marvin-phase-ops — Housekeeping
 
-You are a Marvin phase agent. Your job: reap stale teammates, record cycle stats, run the hourly digest, and trim old data. Then exit with a summary.
 
-**Read config** from the path provided in the prompt (the `Config:` parameter). If no config path is provided, fall back to `config/default.json` (relative to the marvin repo root).
+You are a Marvin phase agent for ops. Trim old data, reap stale teammates, record cycle stats, and run the hourly digest.
 
-## Constants
+## Safety invariants
 
-```
-DB_PATH="$HOME/.marvin/state/marvin.db"
-```
+- Never create tickets in Linear — only update existing ones (comments, state changes, assignments)
+- Never merge PRs — always create as draft, undraft only when CI passes and review comments are addressed
+- Never deploy anything
+- Never modify main directly on target repos — always use worktrees branching from `origin/main`
+- Never force push
+- Never read .env files
 
+## State management
+
+- SQLite database at `~/.marvin/state/marvin.db`
+- Schema managed via numbered migrations in `schema/migrations/` — run `scripts/migrate.sh`
+- All timestamps use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — never `datetime('now')`
+
+### Database tables this phase reads/writes
+
+| Table | Purpose |
+|-------|---------|
+| `tickets` | Reap stale executors/explorers, read for stats |
+| `runs` | Per-cycle stats (tickets found/triaged/executed/failed) |
+| `digests` | Hourly digest history |
+| `audit_runs` | Reap stale auditors |
+| `review_runs` | Reap stale reviewers |
+| `ci_fix_runs` | Reap stale CI fixers |
+| `doc_runs` | Reap stale docs workers |
+| `cycle_events` | Per-cycle event log, trimmed to 500 rows |
+| `spawn_queue` | Trimmed to remove old completed/cancelled entries |
+| `heartbeat` | Read for cycle number |
+
+## Reaping thresholds
+
+Workers are reaped (marked as failed/timed out) if they haven't updated `last_phase_at` within their stale threshold:
+
+| Worker type | Stale after (minutes) | DB table | Status field |
+|------------|----------------------|----------|-------------|
+| Executor | `stale_executor_minutes` (default 120) | `tickets` | `status = 'executing'` |
+| Explorer | `stale_executor_minutes` (default 120) | `tickets` | `status = 'exploring'` |
+| Reviewer | `stale_reviewer_minutes` (default 60) | `review_runs` | `status = 'running'` |
+| CI fixer | `stale_ci_fix_minutes` (default 30) | `ci_fix_runs` | `status = 'running'` |
+| Auditor | `stale_auditor_minutes` (default 30) | `audit_runs` | `status = 'running'` |
+| Docs | `stale_docs_minutes` (default 30) | `doc_runs` | `status = 'running'` |
+
+## Data retention rules
+
+- `cycle_events`: capped at 500 rows
+- `digests`: retained indefinitely
+- `spawn_queue`: old completed/cancelled entries trimmed
+
+## Digest
+
+Hourly digest generation controlled by `digest_interval_minutes` from config (default 120). Summarizes: what got done, what's in flight, what needs attention.
 ## 1. Trim old data
 
 Keep cycle_events for 24 hours; digests for 7 days; spawn_queue for 24 hours:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  DELETE FROM cycle_events WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-24 hours');
-  DELETE FROM digests WHERE sent_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days');
-  DELETE FROM spawn_queue WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-24 hours');
-"
+```sql
+DELETE FROM cycle_events WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-24 hours');
+DELETE FROM digests WHERE sent_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days');
+DELETE FROM spawn_queue WHERE created_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-24 hours');
 ```
 
 ## 2. Reap stale teammates
 
 Teammates can hang, crash, or exceed context limits without updating the DB. Detect and clean up stale work so it can be retried. Use the timeout values from `config.limits`.
 
+### Staleness thresholds
+
+| Worker type | Timeout | DB table | Status field | Timeout field | Gets retry? |
+|-------------|---------|----------|--------------|---------------|-------------|
+| Executor | `stale_executor_minutes` (default 120) | `tickets` | `status = 'executing'` | `updated_at` | Yes (once) |
+| Explorer | `stale_executor_minutes` (default 120) | `tickets` | `status = 'exploring'` | `updated_at` | Yes (once) |
+| Reviewer | `stale_reviewer_minutes` (default 60) | `review_runs` | `status IN ('running', 'queued')` | `started_at` | No |
+| CI fixer | `stale_ci_fix_minutes` (default 30) | `ci_fix_runs` | `status IN ('running', 'queued')` | `started_at` | No |
+| Auditor | `stale_auditor_minutes` (default 30) | `audit_runs` | `status IN ('running', 'queued')` | `started_at` | No |
+| Docs | `stale_docs_minutes` (default 30) | `doc_runs` | `status IN ('running', 'queued')` | `started_at` | No |
+
+Since the orchestrator only sets `executing`/`exploring` status when a worker is actually spawned, any ticket found here had a real worker that got stuck (not a phantom entry from a cancelled spawn).
+
 ### 2a. Stale executors
 
-Tickets stuck in `executing` with no progress beyond the timeout. **Note**: since the orchestrator now only sets `executing` status when a worker is actually spawned, any ticket found here had a real worker that got stuck (not a phantom entry from a cancelled spawn):
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT linear_id, identifier, title, last_phase
-  FROM tickets
-  WHERE status = 'executing'
-    AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 minutes');
-"
+Find tickets stuck in `executing`:
+```sql
+SELECT linear_id, identifier, title, last_phase
+FROM tickets
+WHERE status = 'executing'
+  AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 minutes');
 ```
 
 For each stale executor:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET status = 'failed',
-      error = 'Executor timed out after 120 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE linear_id = '<linear_id>' AND status = 'executing';
-"
+
+1. **Mark failed** with last-phase context:
+```sql
+UPDATE tickets
+SET status = 'failed',
+    error = 'Executor timed out after 120 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE linear_id = '<linear_id>' AND status = 'executing';
 ```
 
-Post a comment on the Linear ticket noting the timeout so it's visible:
-```bash
-# Use create_comment Linear MCP tool:
-# issueId: <linear_id>
-# body: "🤖 **Marvin — execution timed out**\n\nThe executor teammate didn't complete within 120 minutes (stuck in **<last_phase or 'unknown'>** phase). This usually means a hung test run or context limit. The ticket will be retried on the next cycle."
+2. **Post timeout comment** on Linear via `create_comment`:
+```
+🤖 **Marvin — execution timed out**
+
+The executor teammate didn't complete within 120 minutes (stuck in **<last_phase or 'unknown'>** phase). This usually means a hung test run or context limit. The ticket will be retried on the next cycle.
 ```
 
-Then re-queue the ticket for retry by resetting to `triaged`:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET status = 'triaged',
-      error = NULL,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE linear_id = '<linear_id>' AND status = 'failed'
-    AND error LIKE '%timed out%';
-"
+3. **Re-queue for retry** — reset to `triaged`, but **only once**. If the ticket already has a previous "timed out" comment, leave it as `failed` instead:
+```sql
+UPDATE tickets
+SET status = 'triaged',
+    error = NULL,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE linear_id = '<linear_id>' AND status = 'failed'
+  AND error LIKE '%timed out%';
 ```
 
-**Note**: Only retry once. If the ticket was already retried (check if there's a previous "timed out" comment on the ticket), leave it as `failed` instead of re-queuing.
+### 2b. Stale explorers
 
-### 2a2. Stale explorers
-
-Tickets stuck in `exploring` with no progress beyond the timeout (same as executor timeout). Same note applies — these are real spawned workers, not phantoms:
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT linear_id, identifier, title, last_phase
-  FROM tickets
-  WHERE status = 'exploring'
-    AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 minutes');
-"
+Find tickets stuck in `exploring` (same timeout as executors):
+```sql
+SELECT linear_id, identifier, title, last_phase
+FROM tickets
+WHERE status = 'exploring'
+  AND updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 minutes');
 ```
 
-For each stale explorer:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET status = 'failed',
-      error = 'Explorer timed out after 120 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE linear_id = '<linear_id>' AND status = 'exploring';
-"
-```
+Same flow as executors: mark failed with `'Explorer timed out after 120 minutes (last phase: ...)'`, re-queue once.
 
-Re-queue for retry (same once-only rule as executors):
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET status = 'triaged',
-      error = NULL,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE linear_id = '<linear_id>' AND status = 'failed'
-    AND error LIKE '%Explorer timed out%';
-"
-```
+### 2c. Stale review runs
 
-### 2b. Stale review runs
-
-Review runs stuck in `running` beyond the reviewer timeout:
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT id, ticket_linear_id, pr_number, last_phase
-  FROM review_runs
-  WHERE status = 'running'
-    AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 minutes');
-"
+```sql
+SELECT id, ticket_linear_id, pr_number, last_phase
+FROM review_runs
+WHERE status IN ('running', 'queued')
+  AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 minutes');
 ```
 
 For each stale review run:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE review_runs
-  SET status = 'failed',
-      error = 'Review teammate timed out after 60 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE id = <run_id>;
-"
+```sql
+UPDATE review_runs
+SET status = 'failed',
+    error = 'Review teammate timed out after 60 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
+    finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = <run_id>;
 
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET review_status = NULL,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE linear_id = '<ticket_linear_id>'
-    AND review_status = 'review_in_progress';
-"
+-- Reset review_status so next cycle can re-detect pending comments and spawn a new reviewer
+UPDATE tickets
+SET review_status = NULL,
+    updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE linear_id = '<ticket_linear_id>'
+  AND review_status = 'review_in_progress';
 ```
 
-Resetting `review_status` to NULL allows the next cycle to detect the pending comments and spawn a new reviewer.
+### 2d. Stale CI fix runs
 
-### 2c. Stale CI fix runs
-
-CI fix runs stuck in `running` beyond the ci-fix timeout:
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT id, repo, pr_number, last_phase
-  FROM ci_fix_runs
-  WHERE status = 'running'
-    AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
-"
+```sql
+SELECT id, repo, pr_number, last_phase
+FROM ci_fix_runs
+WHERE status IN ('running', 'queued')
+  AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
 ```
 
 For each stale CI fix run:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE ci_fix_runs
-  SET status = 'failed',
-      error = 'CI-fix teammate timed out after 30 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE id = <run_id>;
-"
+```sql
+UPDATE ci_fix_runs
+SET status = 'failed',
+    error = 'CI-fix teammate timed out after 30 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
+    finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = <run_id>;
 
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE pull_requests
-  SET ci_fix_status = NULL,
-      ci_fix_error = 'CI-fix teammate timed out after 30 minutes'
-  WHERE repo = '<repo>' AND pr_number = <pr_number>
-    AND ci_fix_status = 'fix_in_progress';
-"
+-- Reset ci_fix_status so orchestrator re-evaluates next cycle (count already incremented)
+UPDATE pull_requests
+SET ci_fix_status = NULL,
+    ci_fix_error = 'CI-fix teammate timed out after 30 minutes'
+WHERE repo = '<repo>' AND pr_number = <pr_number>
+  AND ci_fix_status = 'fix_in_progress';
 ```
 
-Resetting `ci_fix_status` to NULL lets the orchestrator re-evaluate on the next cycle. The count was already incremented when the teammate was spawned, so no double-counting.
+### 2e. Stale audit runs
 
-### 2d. Stale audit runs
-
-Audit runs stuck in `running` beyond the auditor timeout:
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT id, repo, pr_number, last_phase
-  FROM audit_runs
-  WHERE status = 'running'
-    AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
-"
+```sql
+SELECT id, repo, pr_number, last_phase
+FROM audit_runs
+WHERE status IN ('running', 'queued')
+  AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
 ```
 
 For each stale audit run:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE audit_runs
-  SET status = 'failed',
-      error = 'Audit teammate timed out after 30 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE id = <run_id>;
-"
+```sql
+UPDATE audit_runs
+SET status = 'failed',
+    error = 'Audit teammate timed out after 30 minutes (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
+    finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = <run_id>;
 
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE pull_requests
-  SET audit_status = NULL
-  WHERE repo = '<repo>' AND pr_number = <pr_number>
-    AND audit_status = 'audit_in_progress';
-"
+-- Reset audit_status so PR gets picked up for audit again next cycle
+UPDATE pull_requests
+SET audit_status = NULL
+WHERE repo = '<repo>' AND pr_number = <pr_number>
+  AND audit_status = 'audit_in_progress';
 ```
 
-Resetting `audit_status` to NULL lets the PR be picked up for audit again on the next cycle.
+### 2f. Stale doc runs
 
-### 2e. Stale doc runs
-
-Doc runs stuck in `running` beyond the docs timeout:
-```bash
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT id, ticket_identifier, repo, last_phase
-  FROM doc_runs
-  WHERE status = 'running'
-    AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
-"
+```sql
+SELECT id, ticket_identifier, repo, last_phase
+FROM doc_runs
+WHERE status IN ('running', 'queued')
+  AND started_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 minutes');
 ```
 
 For each stale doc run:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE doc_runs
-  SET status = 'failed',
-      error = 'Docs teammate timed out (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
-      finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE id = <run_id>;
-"
+```sql
+UPDATE doc_runs
+SET status = 'failed',
+    error = 'Docs teammate timed out (last phase: ' || COALESCE(last_phase, 'unknown') || ')',
+    finished_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE id = <run_id>;
 ```
 
 ## 3. Record cycle stats
 
-Count the activity from this cycle period. Query tickets with recent `updated_at` timestamps:
+Count activity from this cycle period (use `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` if `FILTER` syntax is unsupported):
 
-```bash
-sqlite3 ~/.marvin/state/marvin.db "INSERT INTO runs (tickets_found, tickets_triaged, tickets_executed, tickets_reassigned, tickets_deferred, tickets_failed, finished_at) VALUES (<found>, <triaged>, <executed>, <reassigned>, <deferred>, <failed>, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));"
+```sql
+SELECT
+  COUNT(*) FILTER (WHERE triaged_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as found,
+  COUNT(*) FILTER (WHERE status = 'triaged' AND triaged_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as triaged,
+  COUNT(*) FILTER (WHERE status IN ('executing', 'done') AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as executed,
+  COUNT(*) FILTER (WHERE route = 'reassign' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as reassigned,
+  COUNT(*) FILTER (WHERE status = 'deferred' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as deferred,
+  COUNT(*) FILTER (WHERE status = 'failed' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as failed
+FROM tickets;
 ```
 
-To determine counts, query:
-```bash
-# Tickets triaged/executed/etc. in the last cycle interval
-sqlite3 -json ~/.marvin/state/marvin.db "
-  SELECT
-    COUNT(*) FILTER (WHERE triaged_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as found,
-    COUNT(*) FILTER (WHERE status = 'triaged' AND triaged_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as triaged,
-    COUNT(*) FILTER (WHERE status IN ('executing', 'done') AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as executed,
-    COUNT(*) FILTER (WHERE route = 'reassign' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as reassigned,
-    COUNT(*) FILTER (WHERE status = 'deferred' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as deferred,
-    COUNT(*) FILTER (WHERE status = 'failed' AND updated_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 hour')) as failed
-  FROM tickets;
-"
+Insert into runs table:
+```sql
+INSERT INTO runs (tickets_found, tickets_triaged, tickets_executed, tickets_reassigned, tickets_deferred, tickets_failed, finished_at)
+VALUES (<found>, <triaged>, <executed>, <reassigned>, <deferred>, <failed>, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
 ```
-
-If the `FILTER` syntax doesn't work in your SQLite version, use `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` instead.
 
 ## 4. Hourly digest
 
 Check if it's been long enough since the last digest:
-
-```bash
-LAST_DIGEST=$(sqlite3 ~/.marvin/state/marvin.db "SELECT sent_at FROM digests ORDER BY sent_at DESC LIMIT 1;")
-INTERVAL_MINUTES=60  # or read from config digest_interval_minutes, default 60
+```sql
+SELECT sent_at FROM digests ORDER BY sent_at DESC LIMIT 1;
 ```
 
-If no digest exists or the last digest was more than `INTERVAL_MINUTES` ago, generate one:
+Use `digest_interval_minutes` from config (default 60). If no digest exists or the last digest was more than the interval ago, generate one.
 
-a. **Query all the same data as `/marvin-digest`**:
-   - Delta since last digest: count completed/failed/triaged/deferred/merged since last digest `sent_at`
-   - Unclosed tickets by status (failed, executing, triaged, deferred, reassigned)
-   - Recently completed tickets (done, not yet digested)
-   - Pending review comments
-   - Open PRs grouped by readiness
-   - CI failures being auto-fixed
-   - Active teammates with durations (executors, reviewers, CI fixers, auditors)
-   - Audit summary: PRs audited in last 24h, risk distribution, auto-approvals
-   - Decision log: tickets where `json_extract(triage_result, '$.confidence') < 0.7` since last digest
+### Digest data queries
 
-b. **Format as markdown** following the template in `/marvin-digest`, including delta summary, blockers first, decision log, and all other sections.
+Gather all of the following:
+- **Delta since last digest**: count completed/failed/triaged/deferred/merged since last digest `sent_at`
+- **Unclosed tickets by status**: failed, executing, triaged, deferred, reassigned
+- **Recently completed tickets**: done, not yet digested (`digest_included_at IS NULL`)
+- **Pending review comments**: count from `review_comments WHERE status = 'pending'`
+- **Open PRs grouped by readiness**: from `pull_requests WHERE state = 'open'`
+- **CI failures being auto-fixed**: PRs with `ci_fix_status IN ('pending_fix', 'fix_in_progress')`
+- **Active teammates**: executors, reviewers, CI fixers, auditors with durations
+- **Audit summary**: PRs audited in last 24h, risk distribution, auto-approvals
+- **Decision log**: tickets where `json_extract(triage_result, '$.confidence') < 0.7` since last digest
 
-c. **Print to stdout** so it appears in the orchestrator's tmux output.
+### Digest output
 
-d. **Record in the digests table**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  INSERT INTO digests (ticket_ids, content)
-  VALUES ('<json_array_of_ids>', '<digest_content>');
-"
+Format as markdown with delta summary, blockers first, decision log, and all sections. Print to stdout (appears in tmux). Record in digests table:
+
+```sql
+INSERT INTO digests (ticket_ids, content) VALUES ('<json_array_of_ids>', '<digest_content>');
 ```
 
-e. **Mark completed tickets as digested**:
-```bash
-sqlite3 ~/.marvin/state/marvin.db "
-  UPDATE tickets
-  SET digest_included_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-  WHERE status = 'done'
-    AND (digest_included_at IS NULL OR digest_included_at = '');
-"
+Mark completed tickets as digested:
+```sql
+UPDATE tickets
+SET digest_included_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+WHERE status = 'done'
+  AND (digest_included_at IS NULL OR digest_included_at = '');
 ```
 
-The digest goes to stdout (visible in tmux) and the `digests` table (visible on the dashboard). No Linear posting — it's a local status report.
-
-## 5. Log events for significant actions
+## 5. Log reaping events
 
 For any reaping that occurred, log to `cycle_events`:
-```bash
-CYCLE=$(sqlite3 ~/.marvin/state/marvin.db "SELECT cycle_number FROM heartbeat WHERE id = 1;")
-sqlite3 ~/.marvin/state/marvin.db "
-  INSERT INTO cycle_events (cycle_number, step, message)
-  VALUES ($CYCLE, 'reaping', '<message about what was reaped, including last_phase if available — e.g. Reaped stale executor GM-1234 (stuck in explore phase)>');
-"
+```sql
+INSERT INTO cycle_events (cycle_number, step, message)
+VALUES (<cycle>, 'reaping', '<message — include last_phase, e.g. "Reaped stale executor GM-1234 (stuck in explore phase)">');
 ```
 
 ## Output
 
-When done, print a single summary line to stdout and exit:
-
+Print a single summary line and exit:
 ```
 OPS: reaped=<N> stats_recorded digest_sent=<yes/no>
 ```
-
-Where `<N>` is the total number of stale items reaped across all types. This summary is what the orchestrator (EM) sees — keep it short.
 
 ## Safety rules
 

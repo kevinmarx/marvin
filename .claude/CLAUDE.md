@@ -2,85 +2,225 @@
 
 > **NEVER commit or push directly to `main` on repos Marvin works on** (configured in `config.json`). All changes must go through a worktree branch (`<branch_prefix from config>/*`) and a draft PR. The marvin repo itself is fine to commit to main.
 
-Marvin watches Linear for tickets on the configured team — both tickets assigned to the configured assignee and tickets tagged with the configured label (regardless of assignee). It polls triage, backlog, and unstarted states. For all tickets without a specific CODEOWNERS entry, Marvin assigns to the configured assignee and executes via an agent teammate. For tickets with a specific CODEOWNERS entry, Marvin reassigns to the identified owner. Ambiguous tickets where the repo/area can't be determined are deferred.
+Marvin watches Linear for tickets on the configured team — both tickets assigned to the configured assignee and tickets tagged with the configured label (regardless of assignee). It polls triage, backlog, and unstarted states. For all tickets without a specific CODEOWNERS entry, Marvin assigns to the configured assignee and executes via an agent worker. For tickets with a specific CODEOWNERS entry, Marvin reassigns to the identified owner. Ambiguous tickets where the repo/area can't be determined are deferred.
 
 ## Architecture
 
-Marvin is a **phase-based orchestrator with self-restart**. The thin EM loop (`/marvin-cycle`) dispatches work to phase agents each cycle, then sleeps. After a configured number of cycles (default 24, ~24 hours), the EM exits cleanly and the wrapper script (`run-marvin.sh`) restarts it with a fresh context window.
+Marvin has **two runtime modes** that share the same skills, tools, model router, and safety invariants:
+
+1. **Autonomous mode** — overnight ticket processing via polling cycle (orchestrator)
+2. **Assist mode** — real-time human-in-the-loop via WebSocket (realtime server)
+
+### Dual runtime architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Coordination Layer                    │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────┐    │
+│  │ SQLite   │  │ Config   │  │ Spawn Manager  │    │
+│  │ State DB │  │ (JSON)   │  │ (fork-based)   │    │
+│  └──────────┘  └──────────┘  └────────────────┘    │
+│                                                      │
+│  ┌──────────────────────────────────────────────┐   │
+│  │ Safety Hooks                                  │   │
+│  │ (branch check, concurrency limit, no-merge)   │   │
+│  └──────────────────────────────────────────────┘   │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────┴──────────────────────────────┐
+│                    Agent Runtime                     │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────┐    │
+│  │ Model    │  │ Tool     │  │ Context Window │    │
+│  │ Router   │  │ Executor │  │ Manager        │    │
+│  └────┬─────┘  └──────────┘  └────────────────┘    │
+│       │                                              │
+│  ┌────┴─────────────────────────────────────────┐   │
+│  │ LiteLLM (multi-provider)                      │   │
+│  │  ┌─────────┐  ┌───────────┐  ┌────────────┐  │   │
+│  │  │ Claude  │  │ GPT-5     │  │ Gemini     │  │   │
+│  │  │ Opus    │  │ Codex     │  │ 2.5 Pro    │  │   │
+│  │  └─────────┘  └───────────┘  └────────────┘  │   │
+│  │  ┌─────────┐  ┌───────────┐                   │   │
+│  │  │ Claude  │  │ GPT-4o   │  (cost-optimized) │   │
+│  │  │ Sonnet  │  │          │                    │   │
+│  │  └─────────┘  └───────────┘                   │   │
+│  └───────────────────────┬──────────────────────┘   │
+│                          │                           │
+│  ┌───────────────────────┴──────────────────────┐   │
+│  │ Feedback Loop                                 │   │
+│  │ (outcome tracking, human ratings, learned     │   │
+│  │  routing weights per task×model)               │   │
+│  └──────────────────────────────────────────────┘   │
+│                                                      │
+│  Tools: file_read, file_write, file_edit, bash,     │
+│         glob, grep, linear_api, git, gh             │
+└──────────────────────┬──────────────────────────────┘
+                       │
+┌──────────────────────┴──────────────────────────────┐
+│                 Skills (portable)                    │
+│                                                      │
+│  execute, explore, review, ci_fix, audit, docs,     │
+│  reassign, digest, orchestrator, phase_ops,          │
+│  phase_triage, phase_pr                              │
+└─────────────────────────────────────────────────────┘
+```
+
+### Autonomous mode (orchestrator)
+
+The orchestrator (`runtime/src/orchestrator.ts`) runs a cycle loop, dispatching work to phase functions and spawning workers as child processes. After a configured number of cycles (default 48, ~24 hours), it exits cleanly and the wrapper script restarts it.
 
 ```
 run-marvin.sh (restart loop)
-  └─ claude (orchestrator / team lead) — /marvin-cycle
+  └─ npx tsx src/orchestrator-cli.ts
        │
-       ├─ Phase 1: /marvin-phase-ops (Task agent, sequential)
-       │    ├─ Trim old data (cycle_events, digests, spawn_queue)
-       │    ├─ Reap stale teammates (all 5 types)
+       ├─ Phase 1: phaseOps() (inline function call)
+       │    ├─ Reap stale workers via SpawnManager
+       │    ├─ Trim old data (cycle_events, digests)
        │    ├─ Record cycle stats
        │    └─ Hourly digest
        │
-       ├─ Phase 2: /marvin-phase-triage (Task agent, sequential)
+       ├─ Phase 2: phaseTriage() (inline function call)
        │    ├─ Process dashboard reassess requests
        │    ├─ Poll Linear (assigned to me + Platform label)
        │    ├─ Filter & triage new tickets
        │    ├─ Route (execute/explore/reassign/defer)
-       │    │    ├─ execute → assign to configured assignee, setup worktree, queue executor in spawn_queue
-       │    │    ├─ explore → assign to configured assignee, setup worktree, queue explorer in spawn_queue
-       │    │    ├─ reassign → assign to CODEOWNERS person
-       │    │    └─ defer → post clarifying questions
-       │    └─ Poll deferred tickets for new info
+       │    └─ Return SpawnRequests for workers
        │
-       ├─ Drain spawn_queue → spawn executors/explorers (background)
+       ├─ drainAndSpawn() → fork executor/explorer workers
        │
-       ├─ Phase 3: /marvin-phase-pr (Task agent, sequential)
-       │    ├─ Poll open PRs, upsert into DB (incl. merge status)
-       │    ├─ Auto-rebase behind PRs (when CI passes + reviews addressed)
-       │    ├─ Detect CI failures, queue CI-fix in spawn_queue
-       │    ├─ Detect audit candidates, queue auditors in spawn_queue
-       │    ├─ Poll review comments, queue reviewers in spawn_queue
-       │    ├─ Undraft ready PRs (requires MERGEABLE)
-       │    └─ Queue docs in spawn_queue
+       ├─ Phase 3: phasePR() (inline function call)
+       │    ├─ Poll open PRs, upsert into DB
+       │    ├─ Auto-rebase behind PRs
+       │    ├─ Detect CI failures, audit candidates, review comments
+       │    └─ Return SpawnRequests for CI-fix/audit/review/docs workers
        │
-       ├─ Drain spawn_queue → spawn CI-fixers/auditors/reviewers/docs (background)
+       ├─ drainAndSpawn() → fork CI-fix/audit/review/docs workers
        │
        ├─ Self-restart check (exit after N cycles)
        └─ Sleep (cycle_interval_seconds, default 1800)
 ```
 
-### Phase execution model
+Workers are spawned as **child processes** via `child_process.fork()`. Each worker runs `agent.ts` with `SKILL` and `ARGS` env vars. Workers communicate back via Node IPC:
+- `{ type: 'heartbeat', phase }` — liveness signal
+- `{ type: 'complete', success }` — worker done
+- `{ type: 'failed', error }` — worker failed
 
-Phases run as **short-lived Task agents** (not Skill invocations). Each phase loads its own command, does all work, **queues worker spawn requests in the `spawn_queue` DB table**, returns a short summary, and exits. After each phase completes, the orchestrator drains the spawn queue and spawns the workers itself. This is critical because phase agents are short-lived — if they spawned workers directly as background Task agents, the Claude runtime would kill those children when the phase exits. By having the long-lived orchestrator do the spawning, workers survive and run to completion.
+**Concurrency limit**: 8 concurrent workers max, enforced in-memory by SpawnManager.
 
-The EM's context only grows by ~10 lines per phase per cycle, plus a few lines per queued worker spawn. At 48 cycles × 3 phases × ~10 lines = ~1440 lines before self-restart.
+### Assist mode (realtime server)
 
-### Worker types
+The realtime server (`runtime/src/realtime.ts`) runs a WebSocket server on port 7780. A human connects via the dashboard's Assist tab and interacts with agents in real time.
 
-| Role | Command | Queued by | Spawned by | What it does |
-|------|---------|-----------|-----------|--------------|
-| Executor | `/marvin-execute` | phase-triage | orchestrator | Explore → plan → implement → test → commit → push → draft PR |
-| Explorer | `/marvin-explore` | phase-triage | orchestrator | Investigate codebase → post findings to Linear (complexity ≥ 3, no implementation) |
-| Docs | `/marvin-docs` | phase-pr | orchestrator | Read executor knowledge → update CLAUDE.md/READMEs → docs PR |
-| Reviewer | `/marvin-review` | phase-pr | orchestrator | Sync worktree → address review comments → commit → push |
-| CI fixer | `/marvin-ci-fix` | phase-pr | orchestrator | Investigate CI failure → fix → test → push |
-| Auditor | `/marvin-audit` | phase-pr | orchestrator | Classify size → architectural review → risk assess → label/approve |
+- Spawn agents on demand (any skill, any model)
+- Stream agent output (tool calls, thinking, text) to the browser in real time
+- Send messages to running agents (injected into conversation)
+- Interrupt agents mid-execution
 
-Workers are spawned via a **spawn queue** (`spawn_queue` table). Phase agents write spawn requests to the queue; the orchestrator drains the queue after each phase completes and spawns the workers. This ensures workers survive as long-lived background Task agents of the orchestrator, rather than being killed when the short-lived phase agent exits.
+Both modes share the same skills, tools, model router, and safety invariants. The difference is who directs the work.
 
-**Concurrency limit**: The orchestrator enforces a global maximum of **8 concurrent workers** across all types. Before draining the spawn queue, it counts running workers (executing/exploring tickets + running audit/review/ci_fix/doc runs). Only `8 - running` workers are spawned; the rest stay pending in the queue for the next cycle.
+### Skills architecture
 
-The orchestrator session launched via `run-marvin.sh` with only essential plugins (linear-mcp, local-memory-mcp) to keep teammate spawn commands short enough for tmux.
+Skills are the **portable source of truth** for all agent behavior. They live in `skills/` and contain pure domain logic — what to do, not how to be an agent.
 
-LiteLLM proxy env vars (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_SMALL_FAST_MODEL`) are set in `~/.zshrc` so all shells and teammate processes inherit them.
+```
+skills/
+  execute.md         # Explore → plan → implement → test → commit → PR
+  explore.md         # Investigate codebase → post findings (no implementation)
+  review.md          # Address PR review comments → commit → push
+  ci-fix.md          # Investigate CI failure → fix → test → push
+  audit.md           # Classify size → architectural review → risk assess
+  docs.md            # Read executor knowledge → update docs → PR
+  reassign.md        # Reassign ticket via CODEOWNERS
+  digest.md          # Executive summary of activity
+  orchestrator.md    # Main cycle loop logic
+  phase-ops.md       # Ops phase: reap, stats, digest, trim
+  phase-triage.md    # Triage phase: poll, assess, route
+  phase-pr.md        # PR phase: poll, rebase, CI-fix, audit, review, undraft
+  helpers/
+    phase-checkpoint.md   # SQL checkpoint patterns per worker type
+    branch-safety.md      # Branch verification snippets
+    git-operations.md     # Push refspec, worktree, rebase patterns
+    error-handling.md     # DB update + Linear comment on failure
+    test-selection.md     # Language-specific test commands
+    linear-operations.md  # Linear API patterns
+    github-operations.md  # GitHub CLI patterns
+```
+
+Skills compile to multiple harness formats via `harness/compile.ts`:
+- **Claude Code**: `npx tsx harness/compile.ts --target claude-code` → `.claude/commands/*.md`
+- **Codex**: `npx tsx harness/compile.ts --target codex` → `harness/output/codex/*.md`
+- **Raw API**: the runtime itself (`runtime/src/agent.ts` + `runtime/src/skills.ts`)
+
+> **Generated commands**: All `.claude/commands/marvin-*.md` files are now generated from skills. Do not edit them directly — edit the skill file and recompile.
+
+### Smart model routing
+
+The router (`runtime/src/router/router.ts`) picks the best frontier model for each task. Every task gets a top-tier thinking model — the question is *which one*.
+
+**4-tier selection cascade**:
+1. **Manual overrides** — human says "force Opus for Go" via dashboard
+2. **Learned weights** — feedback data says Opus scores 0.85 for go_bugfix
+3. **Language affinity** — static multipliers (e.g. Opus +30% for Go, GPT-5 +30% for TypeScript)
+4. **Default routing** — static fallback
+
+**Default routing table**:
+
+| Task | Default model | Cost tier | Reason |
+|------|--------------|-----------|--------|
+| execute:explore | claude-opus | high | Deep codebase analysis |
+| execute:plan | claude-opus | high | Architecture decisions |
+| execute:implement | gpt5-codex | medium | Raw coding speed |
+| execute:test | gpt5-codex | medium | Test generation |
+| review | claude-opus | high | Understanding reviewer intent |
+| ci_fix | claude-sonnet | low | Log parsing + targeted fixes |
+| audit | gemini-pro | medium | Large context for full-PR review |
+| explore | claude-opus | high | Deep analysis |
+| docs | claude-sonnet | low | Writing, doesn't need frontier reasoning |
+| triage | claude-sonnet | low | Structured JSON output from a rubric |
+| phase_ops | gpt4o | low | Digest synthesis only |
+| phase_triage | claude-sonnet | low | Triage judgment calls |
+| phase_pr | gpt4o | low | Rarely needs model calls in v2 |
+
+**Provider pool** (configured in `config.routing.providers`):
+
+| Provider | LiteLLM model | Cost tier | Max context |
+|----------|---------------|-----------|-------------|
+| claude-opus | `anthropic/claude-opus-4` | high | 200K |
+| gpt5-codex | `openai/gpt-5-codex` | medium | 128K |
+| gemini-pro | `google/gemini-2.5-pro` | medium | 1M |
+| claude-sonnet | `anthropic/claude-sonnet-4` | low | 200K |
+| gpt4o | `openai/gpt-4o` | low | 128K |
+
+### Feedback loop
+
+Every agent run records structured outcomes in the `model_runs` table:
+- **Automatic signals**: success, tests_passed, test_retries, ci_passed, pr_review_rounds, tokens_used, duration_seconds, tool_call_count
+- **Human feedback** (via dashboard Models tab): human_rating (1-5), code_quality, correctness, efficiency, test_quality, notes
+
+Composite score calculation (6 signals, weights sum to 1.0):
+- human_rating: 0.30 (most important, falls back to success_rate)
+- success_rate: 0.25
+- ci_pass_rate: 0.15
+- test_first_pass: 0.10
+- review_efficiency: 0.10
+- token_efficiency: 0.10
+
+Confidence = min(sample_count / 20, 1.0). Learned weights take effect after 5+ runs per task type.
 
 ## Safety invariants
 
 - Never create tickets in Linear — only update existing ones (comments, state changes, assignments)
 - Never merge PRs — always create as draft, undraft only when CI passes and review comments are addressed
-- Auto-approval only for risk:low PRs with passing CI (via audit teammates)
+- Auto-approval only for risk:low PRs with passing CI (via audit workers)
 - Never deploy anything
 - Never modify main directly on target repos — always use worktrees branching from `origin/main`
 - Always push with explicit refspec (`HEAD:refs/heads/<branch>`) — never rely on upstream tracking
 - Always unset upstream tracking on new worktree branches to prevent accidental push to main
-- Branch safety re-check before every commit/push phase in all teammate commands
+- Branch safety re-check before every commit/push in all worker skills
+- Never force push
+- Never read .env files
 - Human review is always required before merging (except risk:low auto-approvals)
 
 ## State management
@@ -97,20 +237,20 @@ LiteLLM proxy env vars (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC
 | `tickets` | `001_initial.sql` | Core ticket tracking, triage results, execution status, PR info, defer fields |
 | `runs` | `001_initial.sql` | Per-cycle stats (tickets found/triaged/executed/failed) |
 | `digests` | `001_initial.sql` | Hourly digest history |
-| `pull_requests` | `001_initial.sql` | All open PRs (your assignee's + all repos configured for audit), CI/review/audit status, merge conflict detection, auto-rebase tracking (migration 007) |
+| `pull_requests` | `001_initial.sql` | All open PRs, CI/review/audit status, merge conflict detection, auto-rebase tracking |
 | `review_comments` | `001_initial.sql` | Individual PR review comments with addressing status |
 | `review_runs` | `001_initial.sql` | Review processing sessions |
 | `ci_fix_runs` | `001_initial.sql` | CI fix attempt tracking per PR |
-| `audit_runs` | `001_initial.sql` | Audit attempt tracking per PR, with `findings_json` (migration 002) |
+| `audit_runs` | `001_initial.sql` | Audit attempt tracking per PR, with `findings_json` |
 | `schema_version` | `001_initial.sql` | Tracks applied migrations |
 | `heartbeat` | `003_heartbeat.sql` | Singleton row: orchestrator liveness (cycle number, current step, last beat) |
 | `cycle_events` | `003_heartbeat.sql` | Per-cycle event log for dashboard activity (capped at 500 rows) |
 | `reassess_requests` | `004_reassess_queue.sql` | Dashboard → orchestrator queue for manual re-triage requests |
 | `doc_runs` | `005_doc_runs.sql` | Documentation follow-up PR tracking |
-| `spawn_queue` | `008_spawn_queue.sql` | Worker spawn requests: phases queue, orchestrator drains and spawns |
-| (last_phase columns) | `009_worker_progress.sql` | Adds `last_phase TEXT` to tickets, audit_runs, ci_fix_runs, review_runs, doc_runs for timeout diagnostics |
-| (last_phase_at columns) | `010_worker_heartbeat.sql` | Adds `last_phase_at TEXT` to tickets, audit_runs, ci_fix_runs, review_runs, doc_runs for liveness tracking |
-| (ticket_linear_id column) | `011_spawn_queue_ticket.sql` | Adds `ticket_linear_id TEXT` to spawn_queue for status rollback on cancelled spawns |
+| `spawn_queue` | `008_spawn_queue.sql` | Worker spawn requests (v1 only — v2 runtime uses in-memory SpawnManager) |
+| `model_runs` | `012_model_feedback.sql` | Per-run model performance tracking for feedback loop |
+| `routing_weights` | `012_model_feedback.sql` | Learned routing weights per task_type×language×model |
+| `routing_overrides` | `012_model_feedback.sql` | Manual routing overrides (human forces a model for a task type) |
 
 ### Configuration
 
@@ -127,7 +267,7 @@ Config in `config/default.json` (see `config/example.json` for a template):
   "worktree_root": "/path/to/worktrees",
   "complexity_threshold": 2,
   "confidence_threshold": 0.7,
-  "digest_interval_minutes": 60,
+  "digest_interval_minutes": 120,
   "state_db": "~/.marvin/state/marvin.db",
   "log_dir": "~/.marvin/logs",
   "backup_dir": "~/.marvin/backups",
@@ -152,15 +292,25 @@ Config in `config/default.json` (see `config/example.json` for a template):
     "ci_fix_min_interval_minutes": 10,
     "ci_fix_max_files": 5,
     "executor_max_test_retries": 2,
-    "poll_interval_idle_seconds": 900,
-    "poll_interval_active_seconds": 120,
     "stale_executor_minutes": 120,
     "stale_reviewer_minutes": 60,
     "stale_ci_fix_minutes": 30,
     "stale_auditor_minutes": 30,
     "stale_docs_minutes": 30,
     "rebase_max_attempts": 3,
-    "rebase_min_interval_minutes": 10
+    "rebase_min_interval_minutes": 10,
+    "max_concurrent_workers": 8
+  },
+  "routing": {
+    "providers": {
+      "claude-opus": { "litellm_model": "anthropic/claude-opus-4", "enabled": true },
+      "gpt5-codex": { "litellm_model": "openai/gpt-5-codex", "enabled": true },
+      "gemini-pro": { "litellm_model": "google/gemini-2.5-pro", "enabled": true },
+      "claude-sonnet": { "litellm_model": "anthropic/claude-sonnet-4", "enabled": true },
+      "gpt4o": { "litellm_model": "openai/gpt-4o", "enabled": true }
+    },
+    "min_runs_for_learned_routing": 5,
+    "confidence_threshold": 0.7
   }
 }
 ```
@@ -169,19 +319,87 @@ Config in `config/default.json` (see `config/example.json` for a template):
 
 Web UI at `http://localhost:7777` (run `scripts/dashboard.py`):
 - **Health banner**: Green (pulsing) / yellow / red based on orchestrator heartbeat age
-- **Tabs**: Tickets, Teammates, Work, Digests, Log
+- **Tabs**: Tickets, Teammates, Models, Work, Digests, Log, Assist
+- **Models tab**: Unrated runs for human feedback, routing weights table, performance stats, manual overrides
+- **Assist tab**: WebSocket client connecting to realtime server on `:7780` — spawn agents, stream output, send messages, interrupt
 - **Re-assess button** (↻) on each ticket to queue manual re-triage
 - Auto-refreshes every 60s
-- `/api/heartbeat`, `/api/tickets`, `/api/prs`, `/api/activity`, `/api/teammates` endpoints
+
+## Runtime directory structure
+
+```
+runtime/
+  src/
+    agent.ts            # Core agent loop (skill → model → tools → repeat)
+    agent-events.ts     # Streaming agent loop with EventEmitter for realtime mode
+    orchestrator.ts     # Autonomous cycle loop
+    orchestrator-cli.ts # CLI entry point: npx tsx src/orchestrator-cli.ts
+    realtime.ts         # WebSocket server for assist mode
+    realtime-cli.ts     # CLI entry point: npx tsx src/realtime-cli.ts
+    spawn.ts            # Fork-based worker manager with IPC heartbeats
+    config.ts           # JSON config loader with Zod validation
+    state.ts            # SQLite state manager (same schema as existing DB)
+    safety.ts           # Pre-execution hooks (branch, force push, concurrency, .env)
+    context.ts          # Context window management (token estimation, compaction)
+    skills.ts           # Skill file loader with helper inlining
+    types.ts            # Shared type definitions
+    tools/
+      index.ts          # Tool registry and dispatcher
+      file.ts           # file_read, file_write, file_edit
+      search.ts         # glob_search, grep_search
+      bash.ts           # bash_exec with timeout
+      git.ts            # Git operations with branch safety
+      github.ts         # GitHub CLI wrappers
+      linear.ts         # Direct Linear GraphQL API client
+    router/
+      router.ts         # 4-tier model selection cascade
+      client.ts         # OpenAI SDK wrapper for LiteLLM proxy
+      feedback.ts       # Run outcome tracking
+      weights.ts        # Composite score calculation
+    phases/
+      types.ts          # SpawnRequest, PhaseResult interfaces
+      ops.ts            # Ops phase (stub — reaps stale workers)
+      triage.ts         # Triage phase (stub)
+      pr.ts             # PR phase (stub)
+```
+
+## Harness compilation
+
+Skills are the portable source of truth. Harnesses compile them into runtime-specific formats.
+
+```
+harness/
+  compile.ts          # CLI: npx tsx harness/compile.ts --target claude-code|codex|all
+  claude-code.ts      # Generates .claude/commands/*.md with checkpoint SQL inlined
+  codex.ts            # Generates harness/output/codex/*.md with SQL stripped
+  types.ts            # Skill metadata registry
+  README.md           # Documentation
+  output/
+    codex/            # Generated Codex task definitions
+```
+
+Usage:
+```bash
+npx tsx harness/compile.ts --target all          # Compile all skills to all targets
+npx tsx harness/compile.ts --target claude-code   # Just Claude Code commands
+npx tsx harness/compile.ts --target codex         # Just Codex tasks
+npx tsx harness/compile.ts --skill execute        # Just one skill
+```
+
+## Worker types
+
+| Role | Skill | Spawned by | Default model | What it does |
+|------|-------|-----------|---------------|--------------|
+| Executor | `execute` | phase-triage | Opus (explore/plan), GPT-5 (implement/test) | Explore → plan → implement → test → commit → push → draft PR |
+| Explorer | `explore` | phase-triage | Opus | Investigate codebase → post findings to Linear (complexity ≥ 3, no implementation) |
+| Docs | `docs` | phase-pr | Sonnet | Read executor knowledge → update CLAUDE.md/READMEs → docs PR |
+| Reviewer | `review` | phase-pr | Opus | Sync worktree → address review comments → commit → push |
+| CI fixer | `ci_fix` | phase-pr | Sonnet | Investigate CI failure → fix → test → push |
+| Auditor | `audit` | phase-pr | Gemini | Classify size → architectural review → risk assess → label/approve |
 
 ## Repo mappings
 
-Repos are configured in `config.json` under the `repos` key. Each entry maps a repo name to its local path. Example:
-
-| Repo | Local path | Content |
-|------|-----------|---------|
-| `your-main-repo` | `<repos.your-main-repo from config>` | Your primary codebase |
-| `your-infra-repo` | `<repos.your-infra-repo from config>` | Infrastructure as code |
+Repos are configured in `config.json` under the `repos` key. Each entry maps a repo name to its local path.
 
 ## Worktree conventions
 
@@ -192,29 +410,31 @@ Repos are configured in `config.json` under the `repos` key. Each entry maps a r
 - Always unset upstream tracking after worktree creation
 - Cleanup: `scripts/cleanup-worktrees.sh [--dry-run]`
 
-## Commands
+## Commands (Claude Code mode)
 
-| Command | Purpose |
-|---------|---------|
-| `/marvin-cycle` | Thin orchestrator loop: dispatch phases → self-restart after N cycles |
-| `/marvin-phase-ops` | Ops phase: reap stale teammates → record stats → digest → trim data |
-| `/marvin-phase-triage` | Triage phase: reassess → poll Linear → triage → route → check deferred |
-| `/marvin-phase-pr` | PR phase: poll PRs → merge status → auto-rebase → CI-fix → audit → reviews → undraft → docs |
-| `/marvin-execute` | Executor worker: explore → plan → implement → test → PR → capture knowledge |
-| `/marvin-explore` | Explore worker: investigate codebase → post findings to Linear (no implementation) |
-| `/marvin-docs` | Docs worker: read executor knowledge → update CLAUDE.md/READMEs → docs PR |
-| `/marvin-review` | Review worker: sync worktree → address comments → commit → push |
-| `/marvin-ci-fix` | CI-fix worker: investigate failure → fix → test → push |
-| `/marvin-audit` | Audit worker: classify size → architectural review → risk assess → label/approve |
-| `/marvin-reassign` | Reassign a ticket based on CODEOWNERS |
-| `/marvin-digest` | Executive summary: what got done, what's in flight, what needs attention |
+All `.claude/commands/marvin-*.md` files are **generated** from `skills/*.md` via `harness/compile.ts`. Do not edit directly.
+
+| Command | Skill source | Purpose |
+|---------|-------------|---------|
+| `/marvin-cycle` | `skills/orchestrator.md` | Orchestrator loop |
+| `/marvin-phase-ops` | `skills/phase-ops.md` | Ops phase |
+| `/marvin-phase-triage` | `skills/phase-triage.md` | Triage phase |
+| `/marvin-phase-pr` | `skills/phase-pr.md` | PR phase |
+| `/marvin-execute` | `skills/execute.md` | Executor worker |
+| `/marvin-explore` | `skills/explore.md` | Explorer worker |
+| `/marvin-docs` | `skills/docs.md` | Docs worker |
+| `/marvin-review` | `skills/review.md` | Review worker |
+| `/marvin-ci-fix` | `skills/ci-fix.md` | CI-fix worker |
+| `/marvin-audit` | `skills/audit.md` | Audit worker |
+| `/marvin-reassign` | `skills/reassign.md` | Reassignment |
+| `/marvin-digest` | `skills/digest.md` | Digest generation |
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
 | `scripts/run-marvin.sh` | Launch orchestrator with auto-restart loop |
-| `scripts/stop-marvin.sh` | Kill wrapper loop, orchestrator, teammates, and dashboard |
+| `scripts/stop-marvin.sh` | Kill wrapper loop, orchestrator, workers, and dashboard |
 | `scripts/setup.sh` | First-time DB initialization via migrations |
 | `scripts/migrate.sh` | Apply pending schema migrations |
 | `scripts/backup-db.sh` | Safe SQLite backup with 7-day retention |
@@ -241,32 +461,50 @@ The triage prompt template is at `prompts/triage.md`. It produces a JSON object 
 
 | Route | When | Action |
 |-------|------|--------|
-| `execute` | No specific CODEOWNERS entry, complexity ≤ `complexity_threshold` (default 2) | Assign to the configured assignee, setup worktree, queue executor (ticket stays `triaged` until orchestrator spawns) |
-| `explore` | No specific CODEOWNERS entry, complexity > `complexity_threshold` | Assign to the configured assignee, setup worktree, queue explorer (ticket stays `triaged` until orchestrator spawns) |
+| `execute` | No specific CODEOWNERS entry, complexity ≤ `complexity_threshold` (default 2) | Assign to configured assignee, setup worktree, spawn executor |
+| `explore` | No specific CODEOWNERS entry, complexity > `complexity_threshold` | Assign to configured assignee, setup worktree, spawn explorer |
 | `reassign` | Specific CODEOWNERS entry exists | Reassign in Linear to that person |
 | `defer` | Can't determine repo/area | Post clarifying questions |
 
-## Key references
-
-- Target repo conventions: `<repo_path from config>/.claude/CLAUDE.md`
-
 ## Subsystem details
 
-Phase-specific logic (triage routing, PR polling, CI-fix detection, audit spawning, review handling, defer lifecycle, reaping rules) lives in the respective phase command files. Refer to:
-- `/marvin-phase-triage` for triage, defer, and routing details
-- `/marvin-phase-pr` for PR polling, CI-fix, audit, review, undraft, and docs details
-- `/marvin-phase-ops` for reaping thresholds, stats recording, and digest generation
+Domain logic lives in the skill files (`skills/*.md`). Shared patterns live in helpers (`skills/helpers/*.md`). Refer to:
+- `skills/phase-triage.md` for triage, defer, and routing details
+- `skills/phase-pr.md` for PR polling, CI-fix, audit, review, undraft, and docs details
+- `skills/phase-ops.md` for reaping thresholds, stats recording, and digest generation
 
-Worker-specific logic lives in worker command files:
-- `/marvin-execute`, `/marvin-review`, `/marvin-ci-fix`, `/marvin-audit`, `/marvin-docs`
+## Running Marvin
 
-## Known issues and workarounds
+### v2 runtime (standalone TypeScript)
 
-- **Worktree upstream tracking**: Branches created from `origin/main` track main as upstream. Fixed by unsetting upstream on creation and using explicit push refspec `HEAD:refs/heads/<branch>`.
-- **Orchestrator code freshness**: The orchestrator self-restarts every ~24 hours, picking up command file changes. For immediate updates, use `scripts/stop-marvin.sh` then `scripts/run-marvin.sh`.
-- **Phase agent context**: Phase agents are short-lived Task agents. They load their command, do work, and exit. This keeps the EM's context small but means phase agents don't carry state between cycles — all coordination happens via the SQLite DB.
-- **Spawn queue architecture**: Phase agents write worker spawn requests to the `spawn_queue` table instead of spawning workers directly. The orchestrator drains the queue after each phase and spawns workers itself. This is necessary because the Claude runtime terminates all background child Task agents when a parent Task agent exits — if phases spawned workers directly, workers would be killed almost immediately. The orchestrator is the long-lived process whose background Task agents survive.
-- **Deferred ticket status activation**: Ticket status (`executing`/`exploring`) is ONLY set by the orchestrator when it actually spawns a worker from the spawn queue — never by the triage phase. This prevents zombie tickets that count toward concurrency limits but have no running worker. The triage phase stores worktree info on the ticket and includes `ticket_linear_id` in spawn_queue entries. When the orchestrator cancels pending spawns (due to concurrency limits), it rolls the ticket status back to `triaged`. The `spawn_queue` table has a `ticket_linear_id` column (migration 011) to support this rollback.
+```bash
+cd runtime && npm install
+
+# Autonomous mode (overnight)
+npx tsx src/orchestrator-cli.ts
+
+# Assist mode (human-in-the-loop, port 7780)
+npx tsx src/realtime-cli.ts
+
+# Single skill execution
+SKILL=execute ARGS='{"linear_id":"...","identifier":"GM-1234",...}' npx tsx src/agent.ts
+
+# Dashboard (port 7777)
+python3 scripts/dashboard.py
+```
+
+### v1 runtime (Claude Code, still works)
+
+```bash
+# Recompile skills to Claude Code commands first
+npx tsx harness/compile.ts --target claude-code
+
+# Then run via Claude Code
+claude --dangerously-skip-permissions \
+  --plugin-dir "$PLUGINS_DIR/linear-mcp/" \
+  --plugin-dir "$PLUGINS_DIR/local-memory-mcp/" \
+  -p "Run /marvin-cycle"
+```
 
 ## Remote deployment (EKS + Istio)
 
@@ -307,8 +545,12 @@ Internet → Custom domain (CNAME → Istio IngressGateway LB)
 | Variable | Purpose |
 |----------|---------|
 | `MARVIN_REMOTE` | Set to `"1"` — dashboard binds `0.0.0.0`, skip local dashboard launch in run-marvin.sh |
-| `MARVIN_CONFIG` | Path to config JSON (command files read this, falls back to `config/default.json`) |
-| `MARVIN_PLUGINS_DIR` | Path to MCP plugins directory (overrides default `<plugins_dir from config>`) |
+| `MARVIN_CONFIG` | Path to config JSON (falls back to `config/default.json`) |
+| `MARVIN_PLUGINS_DIR` | Path to MCP plugins directory (overrides config) |
+| `LITELLM_BASE_URL` / `ANTHROPIC_BASE_URL` | LiteLLM proxy URL (for v2 runtime) |
+| `LITELLM_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | LiteLLM proxy auth token (for v2 runtime) |
+| `LINEAR_API_KEY` | Linear API key (for v2 runtime direct API calls) |
+| `REALTIME_PORT` | WebSocket server port (default 7780) |
 
 ### First-time deploy
 
@@ -513,5 +755,3 @@ Deep Thought requires these MCP plugins:
 
 - `prompts/dt-alert-assess.md` — alert actionability assessment template
 - `prompts/dt-telemetry-assess.md` — telemetry finding assessment template
-
-

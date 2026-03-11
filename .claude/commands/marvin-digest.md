@@ -1,10 +1,78 @@
-# /marvin-digest — Executive summary of Marvin's work
+<!-- Generated from skills/digest.md by harness/claude-code.ts — DO NOT EDIT DIRECTLY -->
+# /marvin-digest — executive summary of Marvin's work
 
-You are generating a concise, actionable summary of what Marvin has accomplished and what needs attention. This is NOT a data dump — write it as a brief you'd send to a busy engineering manager. Lead with blockers and what needs action, then outcomes.
 
-## Step 1: Gather data
+You are generating an executive summary of what Marvin has accomplished and what needs attention.
 
-Run all these queries to gather the raw data, then synthesize it in step 2.
+## Safety invariants
+
+- Never create tickets in Linear — only update existing ones (comments, state changes, assignments)
+- Never merge PRs — always create as draft, undraft only when CI passes and review comments are addressed
+- Auto-approval only for risk:low PRs with passing CI (via audit workers)
+- Never deploy anything
+- Never modify main directly on target repos — always use worktrees branching from `origin/main`
+- Always push with explicit refspec (`HEAD:refs/heads/<branch>`) — never rely on upstream tracking
+- Always unset upstream tracking on new worktree branches to prevent accidental push to main
+- Branch safety re-check before every commit/push in all worker skills
+- Never force push
+- Never read .env files
+- Human review is always required before merging (except risk:low auto-approvals)
+
+## State management
+
+- SQLite database at `~/.marvin/state/marvin.db`
+- Schema managed via numbered migrations in `schema/migrations/` — run `scripts/migrate.sh`
+- All timestamps use `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` — never `datetime('now')`
+
+### Database tables
+
+| Table | Purpose |
+|-------|---------|
+| `tickets` | Core ticket tracking, triage results, execution status, PR info, defer fields |
+| `pull_requests` | All open PRs, CI/review/audit status, merge conflict detection, auto-rebase tracking |
+| `review_comments` | Individual PR review comments with addressing status |
+| `review_runs` | Review processing sessions |
+| `ci_fix_runs` | CI fix attempt tracking per PR |
+| `audit_runs` | Audit attempt tracking per PR, with `findings_json` |
+| `doc_runs` | Documentation follow-up PR tracking |
+| `heartbeat` | Singleton row: orchestrator liveness (cycle number, current step, last beat) |
+| `cycle_events` | Per-cycle event log for dashboard activity (capped at 500 rows) |
+
+## Worker types
+
+| Role | Skill | Spawned by | What it does |
+|------|-------|-----------|--------------|
+| Executor | `execute` | phase-triage | Explore → plan → implement → test → commit → push → draft PR |
+| Explorer | `explore` | phase-triage | Investigate codebase → post findings to Linear (complexity ≥ 3, no implementation) |
+| Docs | `docs` | phase-pr | Read executor knowledge → update CLAUDE.md/READMEs → docs PR |
+| Reviewer | `review` | phase-pr | Sync worktree → address review comments → commit → push |
+| CI fixer | `ci_fix` | phase-pr | Investigate CI failure → fix → test → push |
+| Auditor | `audit` | phase-pr | Classify size → architectural review → risk assess → label/approve |
+
+## Worktree conventions
+
+- Root: `<worktree_root from config>`
+- Implementation branches: `<branch_prefix from config>/gm-{ticket_number}-{slug}`
+- Documentation branches: `<branch_prefix from config>/docs-{identifier}`
+- Always branch from `origin/main` after `git fetch origin main`
+- Always unset upstream tracking after worktree creation
+- Cleanup: `scripts/cleanup-worktrees.sh [--dry-run]`
+
+## Git conventions
+
+- Always push with explicit refspec: `git push -u origin HEAD:refs/heads/<branch_name>`
+- Never rely on upstream tracking — always use explicit refspec
+- Always unset upstream on new worktree branches: `git branch --unset-upstream "$BRANCH" 2>/dev/null || true`
+- Branch safety re-check before every commit/push phase
+
+## Repo mappings
+
+Repos are configured in `config.json` under the `repos` key. Each entry maps a repo name to its local path.
+## Workflow
+
+### Step 1: Gather data
+
+Run all queries to collect raw data:
 
 ```bash
 # Last digest timestamp (for delta calculations)
@@ -23,7 +91,7 @@ sqlite3 -json ~/.marvin/state/marvin.db "
   FROM tickets;
 "
 
-# Recently completed tickets (since last digest)
+# Recently completed tickets (not yet digested)
 sqlite3 -json ~/.marvin/state/marvin.db "
   SELECT identifier, title, complexity, pr_url, pr_number, executed_at, target_repo
   FROM tickets
@@ -98,13 +166,13 @@ sqlite3 -json ~/.marvin/state/marvin.db "
   UNION ALL
   SELECT 'reviewer', t.identifier, rr.started_at
   FROM review_runs rr LEFT JOIN tickets t ON t.linear_id = rr.ticket_linear_id
-  WHERE rr.status = 'running'
+  WHERE rr.status IN ('running', 'queued')
   UNION ALL
   SELECT 'ci-fixer', repo || ' #' || pr_number, started_at
-  FROM ci_fix_runs WHERE status = 'running'
+  FROM ci_fix_runs WHERE status IN ('running', 'queued')
   UNION ALL
   SELECT 'auditor', repo || ' #' || pr_number, started_at
-  FROM audit_runs WHERE status = 'running';
+  FROM audit_runs WHERE status IN ('running', 'queued');
 "
 
 # Review activity (last 24h)
@@ -125,7 +193,7 @@ sqlite3 -json ~/.marvin/state/marvin.db "
   GROUP BY t.identifier;
 "
 
-# Decision log: low-confidence triages since last digest
+# Low-confidence triages since last digest
 sqlite3 -json ~/.marvin/state/marvin.db "
   SELECT identifier, title, route,
     json_extract(triage_result, '$.confidence') as confidence,
@@ -147,11 +215,11 @@ sqlite3 -json ~/.marvin/state/marvin.db "
 "
 ```
 
-## Step 2: Write the digest
+### Step 2: Write the digest
 
-Synthesize the data into a narrative summary. Print to stdout as markdown.
+Synthesize data into a narrative summary. Print to stdout as markdown.
 
-### Format
+#### Format
 
 ```
 # Marvin — {date} {time} digest
@@ -159,8 +227,7 @@ Synthesize the data into a narrative summary. Print to stdout as markdown.
 **Since last digest**: {delta — e.g. "2 tickets completed, 1 failed, 3 triaged, 1 new blocker"}
 
 ## Blockers
-<!-- Things that require human action. Skip section if empty. Be specific about what action is needed. -->
-
+<!-- Things that require human action. Skip section if empty. -->
 {Failed tickets — what failed and what to do}
 {CI fixes exhausted — PR link, failure type, what was tried}
 {Deferred tickets stale >3 days — how long, what question was asked}
@@ -168,42 +235,38 @@ Synthesize the data into a narrative summary. Print to stdout as markdown.
 
 ## Shipped
 <!-- Skip if nothing completed. -->
-
 {Each: "Shipped {outcome} (GM-XXXX) → PR #N"}
 
 ## In flight
 <!-- Only if there are executing tickets or active teammates -->
-
 {Executing tickets with duration}
 {Active teammates}
 
 ## Decision log
 <!-- Skip if no low-confidence triages, reassignments, or defers since last digest -->
-
 {Low-confidence triages (<0.7) — what was decided and why uncertain}
 {Reassignments — who got what}
 {Defers — what question was asked}
 
 ## PRs ready to merge
 <!-- Skip if none -->
-
 {PR #N: title (repo) — CI green, approved, 0 threads}
 
 ## Audit summary
 <!-- Skip if no audits in last 24h -->
-
 {One line: Audited N PRs, risk distribution, auto-approvals}
 ```
 
-### Writing style
+#### Writing style
 
 - **Lead with outcomes**, not process. "Fixed the MFA bypass bug" not "Executed ticket GM-1560"
 - **Be specific about blockers**. "PR #170 ready to merge — CI green, approved, 0 threads" not "1 PR ready"
 - **Quantify when useful**. "Audited 12 PRs (8 low risk, 3 medium, 1 high)" not "Audited PRs"
 - **Skip empty sections entirely** — don't print headers with "None" under them
-- **Keep it under 40 lines** — this should be scannable in 30 seconds
+- **Keep it under 40 lines** — scannable in 30 seconds
+- **Section priority**: blockers first, then shipped, then in flight
 
-## Step 3: Mark completed tickets as digested
+### Step 3: Mark completed tickets as digested
 
 ```bash
 sqlite3 ~/.marvin/state/marvin.db "
@@ -214,7 +277,7 @@ sqlite3 ~/.marvin/state/marvin.db "
 "
 ```
 
-## Step 4: Record digest
+### Step 4: Record digest
 
 ```bash
 sqlite3 ~/.marvin/state/marvin.db "
