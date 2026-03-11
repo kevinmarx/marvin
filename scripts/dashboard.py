@@ -3012,11 +3012,11 @@ def render_page():
             }});
             html += '</div>';
             html += '<div class="assist-message-row">';
-            html += '<input type="text" class="assist-message-input" id="assist-msg-' + escapeHtml(id) + '" placeholder="Send message…" onkeydown="if(event.key===\'Enter\')assistSendMessage(\'' + escapeHtml(id) + '\')" />';
-            html += '<button class="assist-btn assist-btn-secondary" onclick="assistSendMessage(\'' + escapeHtml(id) + '\')">Send</button>';
+            html += '<input type="text" class="assist-message-input" id="assist-msg-' + escapeHtml(id) + '" placeholder="Send message…" onkeydown="if(event.key===&quot;Enter&quot;)assistSendMessage(&quot;' + escapeHtml(id) + '&quot;)" />';
+            html += '<button class="assist-btn assist-btn-secondary" onclick="assistSendMessage(&quot;' + escapeHtml(id) + '&quot;)">Send</button>';
             html += '</div>';
             html += '<div class="assist-agent-actions">';
-            html += '<button class="assist-btn assist-btn-danger" onclick="assistInterrupt(\'' + escapeHtml(id) + '\')">Interrupt</button>';
+            html += '<button class="assist-btn assist-btn-danger" onclick="assistInterrupt(&quot;' + escapeHtml(id) + '&quot;)">Interrupt</button>';
             html += '</div>';
             html += '</div>';
         }});
@@ -3035,7 +3035,7 @@ def render_page():
         var content = escapeHtml(entry.content);
         var expandAttr = '';
         if (entry.fullContent) {{
-            expandAttr = ' class="assist-output-entry assist-output-expandable" onclick="this.textContent=this.dataset.full;this.classList.remove(\'assist-output-expandable\')" data-full="' + escapeHtml('[' + timeStr + '] ' + icon + ' ' + entry.type + ': ' + entry.fullContent).replace(/"/g, '&quot;') + '"';
+            expandAttr = ' class="assist-output-entry assist-output-expandable" onclick="this.textContent=this.dataset.full;this.classList.remove(&quot;assist-output-expandable&quot;)" data-full="' + escapeHtml('[' + timeStr + '] ' + icon + ' ' + entry.type + ': ' + entry.fullContent).replace(/"/g, '&amp;quot;') + '"';
         }} else {{
             expandAttr = ' class="assist-output-entry"';
         }}
