@@ -443,6 +443,7 @@ All `.claude/commands/marvin-*.md` files are **generated** from `skills/*.md` vi
 | `scripts/run-cycle.sh` | Run a single cycle (for testing) |
 | `scripts/run-digest.sh` | Generate a digest |
 | `scripts/pr-age-labels.sh` | Apply age labels (fresh/ripe/overripe/rotting) to open PRs |
+| `scripts/watchdog.sh` | Cron watchdog: restarts Marvin if heartbeat is stale >45min (runs every 15min via crontab) |
 
 ## Triage prompt
 
