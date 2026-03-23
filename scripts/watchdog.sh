@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+# Ensure PATH includes locations that cron doesn't inherit from the interactive shell
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 

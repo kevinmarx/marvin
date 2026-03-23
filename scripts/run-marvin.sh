@@ -15,6 +15,10 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Ensure PATH includes locations that non-interactive shells (cron, nohup) miss
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 # Support remote plugin paths (default: plugins/ in project root)
 PLUGINS_DIR="${MARVIN_PLUGINS_DIR:-$PROJECT_DIR/plugins}"
 PLUGINS=(
@@ -61,8 +65,11 @@ echo ""
 while true; do
   echo "$(date) — Starting orchestrator session..."
 
-  # Run mechanical housekeeping scripts (no agent needed)
-  "$SCRIPT_DIR/pr-age-labels.sh" "${MARVIN_CONFIG:-}" 2>/dev/null || true
+  # Run mechanical housekeeping scripts (no agent needed, 60s timeout to prevent blocking)
+  timeout 60 "$SCRIPT_DIR/pr-age-labels.sh" "${MARVIN_CONFIG:-}" 2>/dev/null || true
+
+  # Unset to allow spawning claude from within another Claude Code session (e.g. watchdog cron)
+  unset CLAUDECODE
 
   claude --dangerously-skip-permissions \
     "${PLUGINS[@]}" \
