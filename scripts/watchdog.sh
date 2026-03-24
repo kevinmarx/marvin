@@ -49,13 +49,13 @@ if [ -z "$LAST_BEAT" ]; then
   exit 0
 fi
 
-# Calculate age in minutes (macOS date -j for parsing)
-if date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_BEAT" "+%s" >/dev/null 2>&1; then
-  BEAT_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_BEAT" "+%s")
-else
-  # Linux fallback
-  BEAT_EPOCH=$(date -d "$LAST_BEAT" "+%s")
-fi
+# Calculate age in minutes
+# Heartbeat timestamps are UTC (ending in Z). Use python for reliable cross-platform UTC parsing.
+BEAT_EPOCH=$(python3 -c "
+from datetime import datetime, timezone
+dt = datetime.strptime('$LAST_BEAT', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+print(int(dt.timestamp()))
+")
 NOW_EPOCH=$(date "+%s")
 AGE_MINUTES=$(( (NOW_EPOCH - BEAT_EPOCH) / 60 ))
 
